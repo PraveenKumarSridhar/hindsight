@@ -1423,6 +1423,7 @@
     "cumulative": "累積",
     "tokensInput": "入力",
     "tokensOutput": "出力",
+    "tokensThoughts": "推論",
     "tokensCached": "キャッシュ",
     "tokensTotal": "合計",
     "tableHeaderTokens": "トークン",

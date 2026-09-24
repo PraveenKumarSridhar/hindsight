@@ -29,8 +29,9 @@ class LLMRequestTokenSums(BaseModel):
     input: StrictInt
     output: StrictInt
     cached: StrictInt
+    thoughts: StrictInt
     total: StrictInt
-    __properties: ClassVar[List[str]] = ["input", "output", "cached", "total"]
+    __properties: ClassVar[List[str]] = ["input", "output", "cached", "thoughts", "total"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -86,6 +87,7 @@ class LLMRequestTokenSums(BaseModel):
             "input": obj.get("input"),
             "output": obj.get("output"),
             "cached": obj.get("cached"),
+            "thoughts": obj.get("thoughts"),
             "total": obj.get("total")
         })
         return _obj

@@ -24,6 +24,7 @@ type LLMRequestTokenSums struct {
 	Input int32 `json:"input"`
 	Output int32 `json:"output"`
 	Cached int32 `json:"cached"`
+	Thoughts int32 `json:"thoughts"`
 	Total int32 `json:"total"`
 }
 
@@ -33,11 +34,12 @@ type _LLMRequestTokenSums LLMRequestTokenSums
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewLLMRequestTokenSums(input int32, output int32, cached int32, total int32) *LLMRequestTokenSums {
+func NewLLMRequestTokenSums(input int32, output int32, cached int32, thoughts int32, total int32) *LLMRequestTokenSums {
 	this := LLMRequestTokenSums{}
 	this.Input = input
 	this.Output = output
 	this.Cached = cached
+	this.Thoughts = thoughts
 	this.Total = total
 	return &this
 }
@@ -122,6 +124,30 @@ func (o *LLMRequestTokenSums) SetCached(v int32) {
 	o.Cached = v
 }
 
+// GetThoughts returns the Thoughts field value
+func (o *LLMRequestTokenSums) GetThoughts() int32 {
+	if o == nil {
+		var ret int32
+		return ret
+	}
+
+	return o.Thoughts
+}
+
+// GetThoughtsOk returns a tuple with the Thoughts field value
+// and a boolean to check if the value has been set.
+func (o *LLMRequestTokenSums) GetThoughtsOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return &o.Thoughts, true
+}
+
+// SetThoughts sets field value
+func (o *LLMRequestTokenSums) SetThoughts(v int32) {
+	o.Thoughts = v
+}
+
 // GetTotal returns the Total field value
 func (o *LLMRequestTokenSums) GetTotal() int32 {
 	if o == nil {
@@ -159,6 +185,7 @@ func (o LLMRequestTokenSums) ToMap() (map[string]interface{}, error) {
 	toSerialize["input"] = o.Input
 	toSerialize["output"] = o.Output
 	toSerialize["cached"] = o.Cached
+	toSerialize["thoughts"] = o.Thoughts
 	toSerialize["total"] = o.Total
 	return toSerialize, nil
 }
@@ -171,6 +198,7 @@ func (o *LLMRequestTokenSums) UnmarshalJSON(data []byte) (err error) {
 		"input",
 		"output",
 		"cached",
+		"thoughts",
 		"total",
 	}
 
