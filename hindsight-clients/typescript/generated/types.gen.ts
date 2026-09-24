@@ -3274,7 +3274,7 @@ export type LlmRequestTokenSums = {
   /**
    * Thoughts
    */
-  thoughts: number;
+  thoughts?: number | null;
   /**
    * Total
    */

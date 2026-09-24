@@ -24,7 +24,7 @@ type LLMRequestTokenSums struct {
 	Input int32 `json:"input"`
 	Output int32 `json:"output"`
 	Cached int32 `json:"cached"`
-	Thoughts int32 `json:"thoughts"`
+	Thoughts NullableInt32 `json:"thoughts,omitempty"`
 	Total int32 `json:"total"`
 }
 
@@ -34,12 +34,11 @@ type _LLMRequestTokenSums LLMRequestTokenSums
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewLLMRequestTokenSums(input int32, output int32, cached int32, thoughts int32, total int32) *LLMRequestTokenSums {
+func NewLLMRequestTokenSums(input int32, output int32, cached int32, total int32) *LLMRequestTokenSums {
 	this := LLMRequestTokenSums{}
 	this.Input = input
 	this.Output = output
 	this.Cached = cached
-	this.Thoughts = thoughts
 	this.Total = total
 	return &this
 }
@@ -124,28 +123,46 @@ func (o *LLMRequestTokenSums) SetCached(v int32) {
 	o.Cached = v
 }
 
-// GetThoughts returns the Thoughts field value
+// GetThoughts returns the Thoughts field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *LLMRequestTokenSums) GetThoughts() int32 {
-	if o == nil {
+	if o == nil || IsNil(o.Thoughts.Get()) {
 		var ret int32
 		return ret
 	}
-
-	return o.Thoughts
+	return *o.Thoughts.Get()
 }
 
-// GetThoughtsOk returns a tuple with the Thoughts field value
+// GetThoughtsOk returns a tuple with the Thoughts field value if set, nil otherwise
 // and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
 func (o *LLMRequestTokenSums) GetThoughtsOk() (*int32, bool) {
 	if o == nil {
 		return nil, false
 	}
-	return &o.Thoughts, true
+	return o.Thoughts.Get(), o.Thoughts.IsSet()
 }
 
-// SetThoughts sets field value
+// HasThoughts returns a boolean if a field has been set.
+func (o *LLMRequestTokenSums) HasThoughts() bool {
+	if o != nil && o.Thoughts.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetThoughts gets a reference to the given NullableInt32 and assigns it to the Thoughts field.
 func (o *LLMRequestTokenSums) SetThoughts(v int32) {
-	o.Thoughts = v
+	o.Thoughts.Set(&v)
+}
+// SetThoughtsNil sets the value for Thoughts to be an explicit nil
+func (o *LLMRequestTokenSums) SetThoughtsNil() {
+	o.Thoughts.Set(nil)
+}
+
+// UnsetThoughts ensures that no value is present for Thoughts, not even an explicit nil
+func (o *LLMRequestTokenSums) UnsetThoughts() {
+	o.Thoughts.Unset()
 }
 
 // GetTotal returns the Total field value
@@ -185,7 +202,9 @@ func (o LLMRequestTokenSums) ToMap() (map[string]interface{}, error) {
 	toSerialize["input"] = o.Input
 	toSerialize["output"] = o.Output
 	toSerialize["cached"] = o.Cached
-	toSerialize["thoughts"] = o.Thoughts
+	if o.Thoughts.IsSet() {
+		toSerialize["thoughts"] = o.Thoughts.Get()
+	}
 	toSerialize["total"] = o.Total
 	return toSerialize, nil
 }
@@ -198,7 +217,6 @@ func (o *LLMRequestTokenSums) UnmarshalJSON(data []byte) (err error) {
 		"input",
 		"output",
 		"cached",
-		"thoughts",
 		"total",
 	}
 

@@ -382,7 +382,7 @@ class LLMRequestTokenSums(BaseModel):
     input: int
     output: int
     cached: int
-    thoughts: int
+    thoughts: int | None = None
     total: int
 
 

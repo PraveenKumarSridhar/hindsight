@@ -380,6 +380,56 @@ async def test_openai_reasoning_tokens_reach_success_and_error_traces(registered
 
 
 @pytest.mark.asyncio
+async def test_openai_tool_trace_keeps_cached_and_reasoning_usage(registered_recorder):
+    """A successful tool-capable reply must expose both reported usage details in its trace."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="qwen")
+    response = _openai_response_with_usage("done")
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 80
+    response.usage.total_tokens = 180
+    response.usage.prompt_tokens_details.cached_tokens = 30
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=60)
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+
+    await llm.call_with_tools(messages=[{"role": "user", "content": "answer"}], tools=[], scope="tools", max_retries=0)
+
+    assert len(registered_recorder.records) == 1
+    trace = registered_recorder.records[0]
+    assert trace.status == "success"
+    assert trace.input_tokens == 100
+    assert trace.output_tokens == 20
+    assert trace.cached_tokens == 30
+    assert trace.thoughts_tokens == 60
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_parse_error_keeps_billed_reasoning_usage(registered_recorder):
+    """Usage is already billed when an unusable tool reply fails local parsing."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="qwen")
+    response = _openai_response_with_usage("done")
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 80
+    response.usage.total_tokens = 180
+    response.usage.prompt_tokens_details.cached_tokens = 30
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=60)
+    response.choices = []
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+
+    with pytest.raises(IndexError):
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "answer"}], tools=[], scope="tools", max_retries=0
+        )
+
+    assert len(registered_recorder.records) == 1
+    trace = registered_recorder.records[0]
+    assert trace.status == "error"
+    assert trace.input_tokens == 100
+    assert trace.output_tokens == 20
+    assert trace.cached_tokens == 30
+    assert trace.thoughts_tokens == 60
+
+
+@pytest.mark.asyncio
 async def test_retain_extract_json_parse_failure_keeps_usage(registered_recorder):
     """The provider call succeeds (and reports usage) but returns non-JSON for a
     structured request; the retain-extraction error trace keeps the tokens."""

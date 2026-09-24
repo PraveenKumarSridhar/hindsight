@@ -1661,6 +1661,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{max_retries + 1}")
                     response = await self._client.chat.completions.create(**call_params)
+                    stash_response_usage(_usage_from_openai_response(response))
 
                 message = response.choices[0].message
                 finish_reason = response.choices[0].finish_reason
@@ -1724,6 +1725,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     finish_reason=finish_reason,
                     error=None,
                     tool_calls=tool_calls_dict,
+                    cached_tokens=cached_tokens,
                     thoughts_tokens=thoughts_tokens,
                 )
 

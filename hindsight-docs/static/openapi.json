@@ -13152,7 +13152,14 @@
             "title": "Cached"
           },
           "thoughts": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Thoughts"
           },
           "total": {
@@ -13165,7 +13172,6 @@
           "input",
           "output",
           "cached",
-          "thoughts",
           "total"
         ],
         "title": "LLMRequestTokenSums",

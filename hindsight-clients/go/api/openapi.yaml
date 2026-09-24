@@ -9124,7 +9124,7 @@ components:
           title: Cached
           type: integer
         thoughts:
-          title: Thoughts
+          nullable: true
           type: integer
         total:
           title: Total
@@ -9133,7 +9133,6 @@ components:
       - cached
       - input
       - output
-      - thoughts
       - total
       title: LLMRequestTokenSums
     LabelGroup-Input:
