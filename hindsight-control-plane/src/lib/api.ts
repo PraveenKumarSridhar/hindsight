@@ -175,7 +175,9 @@ export interface LLMRequestsResponse {
 export interface LLMRequestTokenSums {
   input: number;
   output: number;
-  thoughts: number;
+  // Absent on a server predating reasoning usage; the generated schema is
+  // nullable for the same reason.
+  thoughts: number | null;
   cached: number;
   total: number;
 }

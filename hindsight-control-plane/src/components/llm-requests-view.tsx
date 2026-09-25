@@ -72,7 +72,7 @@ function formatTokens(n: number): string {
 
 // The API keeps total_tokens as input + visible output for compatibility.
 // Add reported reasoning tokens when displaying a complete token total.
-function totalTokens(entry: LLMRequestEntry): number | null {
+export function totalTokens(entry: LLMRequestEntry): number | null {
   if (entry.total_tokens == null) {
     return entry.thoughts_tokens && entry.thoughts_tokens > 0 ? entry.thoughts_tokens : null;
   }
@@ -583,6 +583,10 @@ function LLMRequestChart({ bankId }: { bankId: string }) {
 
   const renderChart = () => {
     if (metric === "tokens" && tokenMode === "breakdown") {
+      // Unstacked lines, not the stacked areas this used to draw: cached is a
+      // subset of input, so the stack height was never a meaningful total, and
+      // adding reasoning to it would have compounded the double-count. The
+      // single-series "total" chart below is where a real total belongs.
       return (
         <LineChart data={chartData} margin={{ top: 5, right: 5, bottom: 0, left: 5 }}>
           <XAxis dataKey="time" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />

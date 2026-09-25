@@ -31,7 +31,7 @@ from hindsight_api.engine.llm_interface import (
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
-from hindsight_api.engine.providers.openai_compatible_llm import _visible_token_usage
+from hindsight_api.engine.providers.openai_compatible_llm import visible_token_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -74,8 +74,8 @@ _STRUCTURED_TOOL_NAME = "structured_response"
 
 
 def _usage_from_litellm_response(response: Any) -> LLMResponseUsage:
-    """Extract prompt/completion/cached token counts from a LiteLLM (OpenAI-shaped) usage block."""
-    usage = _visible_token_usage(response)
+    """Extract input / visible-output / cached / reasoning counts from a LiteLLM (OpenAI-shaped) usage block."""
+    usage = visible_token_usage(response)
     return LLMResponseUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,

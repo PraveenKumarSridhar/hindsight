@@ -390,8 +390,8 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
 
 
 def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
-    """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
-    usage = _visible_token_usage(response)
+    """Extract input / visible-output / cached / reasoning counts from an OpenAI-shaped usage block."""
+    usage = visible_token_usage(response)
     return LLMResponseUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
@@ -400,7 +400,7 @@ def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
     )
 
 
-def _visible_token_usage(response: Any) -> TokenUsage:
+def visible_token_usage(response: Any) -> TokenUsage:
     """Normalize an OpenAI-shaped usage block into visible-only output plus reasoning.
 
     The ``TokenUsage`` contract — and the Gemini provider — treat
@@ -1351,8 +1351,8 @@ class OpenAICompatibleLLM(LLMInterface):
                 usage = response.usage
                 # ``output_tokens``/``total_tokens`` are visible-only past this
                 # point, with reasoning surfaced separately in
-                # ``thoughts_tokens`` — see ``_visible_token_usage``.
-                token_counts = _visible_token_usage(response)
+                # ``thoughts_tokens`` — see ``visible_token_usage``.
+                token_counts = visible_token_usage(response)
                 input_tokens = token_counts.input_tokens
                 output_tokens = token_counts.output_tokens
                 total_tokens = token_counts.total_tokens
@@ -1680,9 +1680,9 @@ class OpenAICompatibleLLM(LLMInterface):
 
                 # Record metrics
                 duration = time.time() - start_time
-                # See ``_visible_token_usage``: ``output_tokens`` is visible-only,
+                # See ``visible_token_usage``: ``output_tokens`` is visible-only,
                 # with reasoning surfaced separately in ``thoughts_tokens``.
-                token_counts = _visible_token_usage(response)
+                token_counts = visible_token_usage(response)
                 input_tokens = token_counts.input_tokens
                 output_tokens = token_counts.output_tokens
                 cached_tokens = token_counts.cached_tokens

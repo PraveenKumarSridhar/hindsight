@@ -27,14 +27,16 @@ def _pg_schema_prefix() -> str:
 
 
 def _pg_upgrade() -> None:
-    op.execute(f"ALTER TABLE {_pg_schema_prefix()}llm_requests ADD COLUMN thoughts_tokens INTEGER")
+    op.execute(f"ALTER TABLE {_pg_schema_prefix()}llm_requests ADD COLUMN IF NOT EXISTS thoughts_tokens INTEGER")
 
 
 def _pg_downgrade() -> None:
-    op.execute(f"ALTER TABLE {_pg_schema_prefix()}llm_requests DROP COLUMN thoughts_tokens")
+    op.execute(f"ALTER TABLE {_pg_schema_prefix()}llm_requests DROP COLUMN IF EXISTS thoughts_tokens")
 
 
 def upgrade() -> None:
+    # oracle slot intentionally absent: llm_requests is created PG-only
+    # (d3e4f5a6b7c8), so there is no Oracle table to alter.
     run_for_dialect(pg=_pg_upgrade)
 
 
