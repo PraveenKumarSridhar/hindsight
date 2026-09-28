@@ -15,6 +15,8 @@ import pytest
 from hindsight_api.config import HindsightConfig
 from hindsight_api.engine.cross_encoder import (
     _OPTION_KEY_OVERHEAD,
+    RRFPassthroughCrossEncoder,
+    ScoreSemantics,
     TypeSafeCrossEncoder,
     create_cross_encoder_from_env,
 )
@@ -115,6 +117,15 @@ def _make_config(**overrides) -> HindsightConfig:
             defaults[f.name] = None
     defaults.update(overrides)
     return HindsightConfig(**defaults)
+
+
+def test_typesafe_declares_ordinal_scores():
+    encoder, _ = _encoder({"c0": 1.0})
+    assert encoder.score_semantics is ScoreSemantics.ORDINAL
+
+
+def test_rrf_passthrough_declares_ordinal_scores():
+    assert RRFPassthroughCrossEncoder().score_semantics is ScoreSemantics.ORDINAL
 
 
 class TestRanking:

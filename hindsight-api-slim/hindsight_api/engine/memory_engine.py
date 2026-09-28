@@ -572,7 +572,7 @@ def validate_sql_schema(sql: str) -> None:
                         )
 
 
-from .cross_encoder import CrossEncoderModel
+from .cross_encoder import CrossEncoderModel, ScoreSemantics, ServedReranker
 from .embeddings import Embeddings, create_embeddings_from_env
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 
@@ -8701,6 +8701,8 @@ class MemoryEngine(MemoryEngineInterface):
             RecallResultModel with results, trace, optional entities, and optional chunks
         """
         # Initialize tracer if requested
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
         from .search.tracer import SearchTracer
 
         # Always trace the PHASES; only capture the rest when asked. The phase metrics are a
@@ -9254,9 +9256,9 @@ class MemoryEngine(MemoryEngineInterface):
             rerank_span.set_attribute("hindsight.candidates_count", len(merged_candidates))
 
             scored_results: list = []
-            # Provider that produced scored_results for THIS call. None until a
-            # cross-encoder rerank returns; rrf/interleave never consult it.
-            served_provider: str | None = None
+            # Complete capability record for this call, independent of the
+            # failover chain's shared active member.
+            served_reranker: ServedReranker | None = None
             pre_filtered_count = 0
             rerank_kind = "cross-encoder"
             try:
@@ -9335,10 +9337,7 @@ class MemoryEngine(MemoryEngineInterface):
                     await reranker_instance.ensure_initialized()
                     reranked = await reranker_instance.rerank(query, merged_candidates)
                     scored_results = reranked.results
-                    # Copied off the call that produced these scores. Do not read
-                    # cross_encoder.provider_name here: on a failover chain that
-                    # property follows a cursor other requests can move.
-                    served_provider = reranked.provider_name
+                    served_reranker = reranked.served
                 else:
                     # "rrf" / "interleave": skip the cross-encoder and keep the fusion order
                     # (rrf_score is descending by fusion position for both). The cross-encoder
@@ -9346,6 +9345,11 @@ class MemoryEngine(MemoryEngineInterface):
                     # "twin") far below the budget cutoff (semantic rank #1 -> reranked #37),
                     # causing the LLM to never see it and create a duplicate.
                     rerank_kind = f"{reranking}-passthrough"
+                    served_reranker = ServedReranker(
+                        provider_name=reranking,
+                        score_semantics=ScoreSemantics.ORDINAL,
+                        prunes_candidates=False,
+                    )
                     scored_results = [
                         ScoredResult(
                             candidate=mc,
@@ -9364,6 +9368,9 @@ class MemoryEngine(MemoryEngineInterface):
                 )
             finally:
                 rerank_span.set_attribute("hindsight.scored_count", len(scored_results))
+                if served_reranker is not None:
+                    rerank_span.set_attribute("hindsight.score_semantics", served_reranker.score_semantics.value)
+                    rerank_span.set_attribute("hindsight.reranker_prunes_candidates", served_reranker.prunes_candidates)
                 if pre_filtered_count > 0:
                     rerank_span.set_attribute("hindsight.pre_filtered_count", pre_filtered_count)
                 rerank_span.end()
@@ -9393,7 +9400,9 @@ class MemoryEngine(MemoryEngineInterface):
                 # (a configured rrf provider, or the failover member that answered).
                 from .search.recall_boost import stage2_passthrough
 
-                is_passthrough = stage2_passthrough(reranking, served_provider)
+                is_passthrough = stage2_passthrough(
+                    reranking, served_reranker.provider_name if served_reranker else None
+                )
                 scoring_config = get_config()
                 apply_combined_scoring(
                     scored_results,
@@ -9429,6 +9438,17 @@ class MemoryEngine(MemoryEngineInterface):
             # (a clearly-relevant match can score ~0.001 while its *ranking* is right).
             min_reranker = min_scores.reranker if min_scores else None
             min_final = min_scores.final if min_scores else None
+            if (
+                min_reranker is not None
+                and scored_results
+                and served_reranker is not None
+                and served_reranker.score_semantics is ScoreSemantics.ORDINAL
+            ):
+                raise OperationValidationError(
+                    f"min_scores.reranker is not supported because the served reranker "
+                    f"{served_reranker.provider_name!r} returns ordinal scores that only encode position",
+                    status_code=400,
+                )
             if (min_reranker is not None or min_final is not None) and scored_results:
                 before_min_score = len(scored_results)
                 scored_results = [
@@ -9454,7 +9474,12 @@ class MemoryEngine(MemoryEngineInterface):
             tracer.add_phase_metric(
                 "reranking",
                 step_duration,
-                {"reranker_type": rerank_kind, "candidates_reranked": len(scored_results)},
+                {
+                    "reranker_type": rerank_kind,
+                    "candidates_reranked": len(scored_results),
+                    "score_semantics": served_reranker.score_semantics.value if served_reranker else None,
+                    "prunes_candidates": served_reranker.prunes_candidates if served_reranker else None,
+                },
             )
             # Combined scoring + additive boosts + final sort, plus -- when a trace was
             # asked for -- the serialization of reranked entries done just above.
@@ -10114,7 +10139,9 @@ class MemoryEngine(MemoryEngineInterface):
             # interleave modes, or the RRFPassthroughCrossEncoder), since its
             # cross_encoder_score_normalized is then a rank-derived placeholder, not a
             # true relevance score.
-            reranker_passthrough = (reranking != "cross_encoder") or served_provider == "rrf"
+            reranker_passthrough = (reranking != "cross_encoder") or (
+                served_reranker is not None and served_reranker.provider_name == "rrf"
+            )
             scores_by_id: dict[str, RecallScores] = {
                 sr.id: RecallScores(
                     final=sr.weight,
@@ -10292,6 +10319,8 @@ class MemoryEngine(MemoryEngineInterface):
             # Client disconnected mid-recall — propagate the cancellation so the
             # HTTP layer can return 499. Must precede the broad handler below,
             # which would otherwise bury it inside a RuntimeError (issue #2122).
+            raise
+        except OperationValidationError:
             raise
         except Exception as e:
             # Use repr(e) so exceptions with empty __str__ (e.g. raise SomeError())

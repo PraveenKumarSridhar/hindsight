@@ -24,6 +24,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 import pytest
+from hindsight_client_api.exceptions import BadRequestException
 
 from hindsight_system_tests import wait_until_settled
 from hindsight_system_tests.payloads import consolidation, extracted, fact
@@ -110,3 +111,21 @@ async def test_a_deeper_cut_keeps_the_top_of_the_same_ranking(typesafe_client, t
     response = await typesafe_client.arecall(bank_id=typesafe_bank, query=QUERY)
 
     assert [result.text for result in response.results] == full_order[:2]
+
+
+async def test_ordinal_floor_is_http_400_and_no_floor_pruning_still_works(typesafe_client, typesafe_bank, stubs):
+    stubs.rerank.cut_level = 0
+
+    with pytest.raises(BadRequestException) as exc_info:
+        await typesafe_client.arecall(
+            bank_id=typesafe_bank,
+            query=QUERY,
+            min_scores={"reranker": 0.5},
+        )
+
+    assert exc_info.value.status == 400
+    assert "min_scores.reranker" in str(exc_info.value)
+    assert "ordinal" in str(exc_info.value)
+
+    response = await typesafe_client.arecall(bank_id=typesafe_bank, query=QUERY)
+    assert [result.text for result in response.results] == [BERLIN]

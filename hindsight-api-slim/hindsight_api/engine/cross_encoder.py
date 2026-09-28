@@ -13,6 +13,8 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import aiohttp
@@ -60,13 +62,27 @@ from .token_encoding import count_tokens, truncate_to_tokens
 
 logger = logging.getLogger(__name__)
 
-# Which member produced the scores for the predict() running in this task.
-# MultiCrossEncoder._active is shared by every request on the chain, so reading
-# it after await rerank can observe a neighbour's failover. This is set in the
-# same task that is about to return those scores, and rerank() copies it onto
-# the result before yielding.
-_served_provider: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "hindsight_rerank_served_provider", default=None
+
+class ScoreSemantics(StrEnum):
+    """Meaning of the numeric scores returned by a reranker."""
+
+    ORDINAL = "ordinal"
+    POINTWISE = "pointwise"
+    CALIBRATED_PROBABILITY = "calibrated_probability"
+
+
+@dataclass(frozen=True)
+class ServedReranker:
+    provider_name: str
+    score_semantics: ScoreSemantics
+    prunes_candidates: bool
+
+
+# MultiCrossEncoder._active is shared by every request on the chain. Capture
+# capabilities in the prediction task so another request's failover cannot
+# change the provider, semantics, or pruning reported by this rerank.
+_served_reranker: contextvars.ContextVar[ServedReranker | None] = contextvars.ContextVar(
+    "hindsight_served_reranker", default=None
 )
 
 
@@ -96,6 +112,8 @@ class CrossEncoderModel(ABC):
 
     Cross-encoders take query-document pairs and return relevance scores.
     """
+
+    score_semantics: ScoreSemantics = ScoreSemantics.POINTWISE
 
     @property
     @abstractmethod
@@ -991,6 +1009,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     how :attr:`prunes_candidates` tells the caller to leave them out.
     """
 
+    score_semantics = ScoreSemantics.ORDINAL
     SYSTEMONE_PATH = "/v1/systemone"
 
     # A Choice accepts at most 255 options; stay clear of the edge. A pool larger
@@ -1261,6 +1280,8 @@ class RRFPassthroughCrossEncoder(CrossEncoderModel):
     - Deployments where reranking latency is unacceptable
     - Debugging to isolate retrieval vs reranking issues
     """
+
+    score_semantics = ScoreSemantics.ORDINAL
 
     def __init__(self):
         """Initialize RRF passthrough cross-encoder."""
@@ -2136,6 +2157,11 @@ class MultiCrossEncoder(CrossEncoderModel):
             try:
                 if not self._ready[index]:
                     await self._ensure_member_ready(index)
+                # Capture all capabilities in this request before predict. A final
+                # member's partial timeout still returns scores from that member.
+                _served_reranker.set(
+                    ServedReranker(member.provider_name, member.score_semantics, member.prunes_candidates)
+                )
                 scores = await member.predict(pairs)
                 if len(scores) != len(pairs):
                     raise RuntimeError(f"returned {len(scores)} scores for {len(pairs)} pairs")
@@ -2157,9 +2183,6 @@ class MultiCrossEncoder(CrossEncoderModel):
                     member.provider_name,
                 )
             self._active = index
-            # Record the member for this task before returning. A later read of
-            # provider_name follows _active and can name a different request.
-            _served_provider.set(member.provider_name)
             return scores
         # All members failed; surface the last error (loop ran at least once).
         assert last_exc is not None

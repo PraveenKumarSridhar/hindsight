@@ -9,12 +9,18 @@ import pytest
 
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine import memory_engine
-from hindsight_api.engine.cross_encoder import CrossEncoderModel, MultiCrossEncoder, RRFPassthroughCrossEncoder
+from hindsight_api.engine.cross_encoder import (
+    CrossEncoderModel,
+    MultiCrossEncoder,
+    RRFPassthroughCrossEncoder,
+    ScoreSemantics,
+)
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.response_models import MinScores, RecallResult
 from hindsight_api.engine.search.reranking import CrossEncoderReranker, RerankResult
 from hindsight_api.engine.search.retrieval import MultiFactTypeRetrievalResult, ParallelRetrievalResult
 from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult
+from hindsight_api.extensions.operation_validator import OperationValidationError
 from hindsight_api.models import RequestContext
 
 
@@ -30,6 +36,26 @@ class _Primary(CrossEncoderModel):
         if pairs[0][0] == "fallback":
             raise RuntimeError("primary unavailable for this request")
         return [0.2] * len(pairs)
+
+
+class _Ordinal(CrossEncoderModel):
+    score_semantics = ScoreSemantics.ORDINAL
+
+    def __init__(self, *, prunes_candidates: bool = False) -> None:
+        self.prunes_candidates = prunes_candidates
+
+    @property
+    def provider_name(self) -> str:
+        return "typesafe"
+
+    async def initialize(self) -> None:
+        pass
+
+    async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        scores = [1.0, 2 / 3, 1 / 3][: len(pairs)]
+        if self.prunes_candidates:
+            return [scores[0], *([0.0] * (len(scores) - 1))]
+        return scores
 
 
 class _ConfigResolver:
@@ -147,9 +173,86 @@ async def test_min_final_filters_after_rank_decay(recall_harness: _RecallHarness
 
 
 @pytest.mark.asyncio
+async def test_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHarness) -> None:
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "min_scores.reranker" in exc_info.value.reason
+    assert "ordinal" in exc_info.value.reason
+    assert "typesafe" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_ordinal_scores_remain_published_without_a_floor(recall_harness: _RecallHarness) -> None:
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
+    result = await recall_harness.recall()
+
+    assert sorted((item.scores.reranker for item in result.results), reverse=True) == pytest.approx([1.0, 2 / 3, 1 / 3])
+
+
+@pytest.mark.asyncio
+async def test_ordinal_reranker_still_allows_min_final(recall_harness: _RecallHarness) -> None:
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
+    result = await recall_harness.recall(min_scores=MinScores(final=0.5))
+    assert result.results
+
+
+@pytest.mark.asyncio
+async def test_provider_pruning_keeps_published_ordinal_score(recall_harness: _RecallHarness) -> None:
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal(prunes_candidates=True))
+    result = await recall_harness.recall()
+    assert len(result.results) == 1
+    assert result.results[0].scores.reranker == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["explicit", "interleave", "provider", "failover"])
+async def test_rrf_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHarness, mode: str) -> None:
+    encoder: CrossEncoderModel = RRFPassthroughCrossEncoder()
+    if mode == "failover":
+        encoder = MultiCrossEncoder([_Primary(), encoder])
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=encoder)
+    reranking = {"explicit": "rrf", "interleave": "interleave"}.get(mode, "cross_encoder")
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall("fallback", reranking=reranking, min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "min_scores.reranker" in exc_info.value.reason
+    assert "ordinal" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_empty_retrieval_accepts_reranker_floor(
+    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRetrievalResult:
+        return MultiFactTypeRetrievalResult(
+            results_by_fact_type={
+                "world": ParallelRetrievalResult(
+                    semantic=[],
+                    bm25=[],
+                    graph=[],
+                    temporal=None,
+                    timings={"semantic": 0.0, "bm25": 0.0, "graph": 0.0, "temporal_extraction": 0.0},
+                )
+            }
+        )
+
+    monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", empty_retrieval)
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
+    result = await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+    assert result.results == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_query", ["primary", "fallback"])
+@pytest.mark.parametrize("with_floor", [False, True])
 async def test_concurrent_recalls_use_their_own_rerank_provider(
-    recall_harness: _RecallHarness, first_query: str
+    recall_harness: _RecallHarness, first_query: str, with_floor: bool
 ) -> None:
     first_scored = asyncio.Event()
     second_scored = asyncio.Event()
@@ -172,11 +275,23 @@ async def test_concurrent_recalls_use_their_own_rerank_provider(
 
     async def second_recall() -> RecallResult:
         await first_scored.wait()
-        return await recall_harness.recall(second_query)
+        return await recall_harness.recall(second_query, min_scores=MinScores(reranker=0.1) if with_floor else None)
 
-    results = await asyncio.wait_for(asyncio.gather(recall_harness.recall(first_query), second_recall()), timeout=5)
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            recall_harness.recall(first_query, min_scores=MinScores(reranker=0.1) if with_floor else None),
+            second_recall(),
+            return_exceptions=with_floor,
+        ),
+        timeout=5,
+    )
     by_query = dict(zip([first_query, second_query], results))
     assert chain.provider_name == ("rrf" if second_query == "fallback" else "tei")
+    if with_floor:
+        assert isinstance(by_query["primary"], RecallResult)
+        assert isinstance(by_query["fallback"], OperationValidationError)
+        assert by_query["fallback"].status_code == 400
+        return
     assert [r.scores.reranker for r in by_query["primary"].results] == pytest.approx([0.2] * 3)
     assert [r.scores.final for r in by_query["primary"].results] == pytest.approx([0.7, 0.2 + 4 / 9, 0.6])
     assert all(r.scores.reranker is None for r in by_query["fallback"].results)
