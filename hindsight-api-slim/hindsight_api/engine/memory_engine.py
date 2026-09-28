@@ -224,6 +224,16 @@ _MM_HISTORY_KIND_FAILURE = "refresh_failed"
 _REFRESH_AUTOMATIC_KEY = "_automatic"
 
 
+def refresh_serialization_key(mental_model_id: str) -> str:
+    """The claim-time serialisation key for a mental model's refreshes.
+
+    The column is shared with per-document retains, whose key is a caller-supplied
+    document id. The claim predicate keeps the two apart by also matching on
+    ``operation_type``; the prefix just makes a refresh's key readable as one.
+    """
+    return f"mental_model:{mental_model_id}"
+
+
 def get_current_schema() -> str:
     """Get the current schema from context (falls back to config default)."""
     schema = _current_schema.get()
@@ -570,6 +580,7 @@ if TYPE_CHECKING:
     from hindsight_api.config_resolver import ValidatedBankConfigUpdate
     from hindsight_api.extensions import (
         BankWriteOperation,
+        MemoryCurationAction,
         OperationValidatorExtension,
         TenantExtension,
         ValidationResult,
@@ -657,11 +668,28 @@ from .response_models import (
 )
 from .response_models import RecallResult as RecallResultModel
 from .retain import bank_utils, embedding_utils
+from .retain.attachment_content import (
+    ContentBlockItem,
+    LoadedAttachment,
+    occurrences_by_chunk,
+    render_chunk_placeholders,
+    select_occurrences,
+    short_attachment_id,
+    validate_and_canonicalize_content,
+)
+from .retain.fact_storage import _normalize_scopes
 from .retain.fold import FoldMemberRef
 from .retain.types import RetainBatchResult, RetainContentDict, merge_processed_content_tokens
 from .search.reranking import CrossEncoderReranker, apply_combined_scoring
 from .search.tag_resolution import MAX_VOCABULARY, TagResolutionError, needs_resolution, resolve_tag_groups
-from .search.tags import TagGroup, TagsMatch, build_tag_groups_where_clause, build_tags_where_clause
+from .search.tags import (
+    TagGroup,
+    TagsMatch,
+    build_tag_groups_where_clause,
+    build_tags_where_clause,
+    strict_tag_group,
+    strict_tags_match,
+)
 from .search.types import ScoredResult
 from .source_facts import select_source_facts_within_budget
 from .task_backend import TaskBackend
@@ -707,6 +735,30 @@ class _LLMCallDefaults:
             "initial_backoff": self.initial_backoff,
             "max_backoff": self.max_backoff,
         }
+
+
+@dataclass(frozen=True)
+class BankFileStream:
+    """Stream of bytes for a bank-scoped stored file with optional content length."""
+
+    stream: AsyncIterator[bytes]
+    size: int | None
+
+
+@dataclass
+class ByteStreamCounter:
+    """Async iterator that counts total bytes yielded by the wrapped byte stream."""
+
+    stream: AsyncIterator[bytes]
+    total_bytes: int = 0
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self
+
+    async def __anext__(self) -> bytes:
+        chunk = await self.stream.__anext__()
+        self.total_bytes += len(chunk)
+        return chunk
 
 
 def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults: _LLMCallDefaults) -> LLMConfig:
@@ -1813,13 +1865,18 @@ def _mental_model_stale_scope(
     trigger = trigger or {}
     tag_filtering = _resolve_refresh_tag_filtering(mm_tags, trigger)
 
+    # A tag-scoped model is stale only when a write lands *in* its tags. The
+    # refresh under "any"/"all" may still read untagged memories, but an untagged
+    # write is not about this model — counting it flagged every such model stale
+    # after nearly every write to a bank that mixes the two (#4857). A model with
+    # no tag filter keeps counting every write: the whole bank is its scope.
     return MemoryScopeWatermark(
         key=key,
         since=since,
         fact_types=list(trigger.get("fact_types") or []),
         tags=tag_filtering.tags,
-        tags_match=tag_filtering.tags_match,
-        tag_groups=tag_filtering.tag_groups,
+        tags_match=strict_tags_match(tag_filtering.tags_match) if tag_filtering.tags else tag_filtering.tags_match,
+        tag_groups=[strict_tag_group(g) for g in tag_filtering.tag_groups] if tag_filtering.tag_groups else None,
     )
 
 
@@ -1923,6 +1980,26 @@ def _summarize_refresh_tool_calls(
             )
         )
     return summaries
+
+
+def _renamed_scopes(scopes: Any, old_tags: list[str] | None, new_tags: list[str]) -> Any:
+    """Move a single-tag rename into an explicit ``observation_scopes`` spec (#4609).
+
+    An explicit ``list[list[str]]`` spec freezes tag strings at retain time, so a retag
+    that renames ``project:old`` -> ``project:new`` would leave consolidation rebuilding
+    observations under the old tag. Scalar modes re-derive from the unit's fresh tags
+    and need nothing. Only an unambiguous rename (exactly one tag removed, one added)
+    is remapped; any other retag returns the spec unchanged.
+    """
+    scopes = _normalize_scopes(scopes)
+    if not isinstance(scopes, list) or old_tags is None:
+        return scopes
+    removed = set(old_tags) - set(new_tags)
+    added = set(new_tags) - set(old_tags)
+    if len(removed) != 1 or len(added) != 1:
+        return scopes
+    old, new = removed.pop(), added.pop()
+    return [[new if t == old else t for t in scope] for scope in scopes]
 
 
 def _operation_details(operation_type: str, result_metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -2418,6 +2495,7 @@ class MemoryEngine(MemoryEngineInterface):
         self._pg0_port = _parsed_pg0.port
         self._pg0_username = _parsed_pg0.username
         self._pg0_password = _parsed_pg0.password
+        self._pg0_config = _parsed_pg0.config
         if self._use_pg0:
             self.db_url = None
         else:
@@ -3139,39 +3217,37 @@ class MemoryEngine(MemoryEngineInterface):
         if not bank_id:
             raise ValueError("bank_id is required for export_documents task")
 
-        from hindsight_api.models import RequestContext
+        from .memories import get_memories
+        from .transfer import stream_export_documents
 
-        context = RequestContext(
-            internal=True,
-            user_initiated=True,
-            tenant_id=task_dict.get("_tenant_id"),
-            api_key_id=task_dict.get("_api_key_id"),
-            retry_count=task_dict.get("_retry_count", 0),
-        )
-
-        archive_bytes = await self.export_documents_async(
+        backend = await self._get_backend()
+        stream = stream_export_documents(
+            backend,
             bank_id,
-            context,
             document_ids,
             include_observations=include_observations,
             include_knowledge_base=include_knowledge_base,
+            memories=get_memories(),
         )
+
+        counter = ByteStreamCounter(stream)
 
         # A fresh uuid per export keeps concurrent/repeat exports of the same bank
         # from clobbering each other's archive.
         storage_key = f"{bank_storage_prefix(bank_id)}exports/{uuid.uuid4()}/transfer.zip"
-        await self._file_storage.store(
-            file_data=archive_bytes,
+        await self._file_storage.store_stream(
             key=storage_key,
+            stream=counter,
             metadata={"content_type": "application/zip", "bank_id": bank_id},
         )
+        total_bytes = counter.total_bytes
         download_url = await self._file_storage.get_download_url(storage_key)
 
         if operation_id:
             result = {
                 "storage_key": storage_key,
                 "download_url": download_url,
-                "byte_size": len(archive_bytes),
+                "byte_size": total_bytes,
                 "filename": f"{bank_id}-documents.zip",
             }
             backend = await self._get_backend()
@@ -3195,7 +3271,7 @@ class MemoryEngine(MemoryEngineInterface):
         import json
 
         from .memories import get_memories
-        from .transfer import TransferScope, build_bank_archive, load_bank_export
+        from .transfer import TransferScope, stream_export_bank
 
         bank_id = task_dict.get("bank_id")
         operation_id = task_dict.get("operation_id")
@@ -3207,36 +3283,36 @@ class MemoryEngine(MemoryEngineInterface):
             history=task_dict.get("include_history", False),
         )
 
+        # Note on snapshot consistency vs. connection hold trade-off:
+        # stream_export_bank streams sections and batches in separate short-lived
+        # connections rather than wrapping the entire export in a single long transaction.
+        # This prevents connection pool exhaustion when banks have gigabytes of attachments
+        # or documents, producing an eventual snapshot across batches.
         backend = await self._get_backend()
-        # One connection for the whole read: a bank is read across a dozen
-        # queries, and a transaction is what makes them one point in time rather
-        # than a smear of whatever was being written meanwhile. Only the *read*
-        # is in here — building the archive is CPU-bound and runs after the
-        # connection is back in the pool (see build_bank_archive).
-        async with acquire_with_retry(backend) as conn:
-            async with conn.transaction():
-                payload = await load_bank_export(
-                    conn,
-                    bank_id,
-                    scope=scope,
-                    memories=get_memories(),
-                    file_storage=self._file_storage,
-                )
-        archive_bytes = await build_bank_archive(payload)
+        stream = stream_export_bank(
+            backend,
+            bank_id,
+            scope=scope,
+            memories=get_memories(),
+            file_storage=self._file_storage,
+        )
+
+        counter = ByteStreamCounter(stream)
 
         storage_key = f"banks/{bank_id}/exports/{uuid.uuid4()}/transfer.zip"
-        await self._file_storage.store(
-            file_data=archive_bytes,
+        await self._file_storage.store_stream(
             key=storage_key,
+            stream=counter,
             metadata={"content_type": "application/zip", "bank_id": bank_id},
         )
+        total_bytes = counter.total_bytes
         download_url = await self._file_storage.get_download_url(storage_key)
 
         if operation_id:
             result = {
                 "storage_key": storage_key,
                 "download_url": download_url,
-                "byte_size": len(archive_bytes),
+                "byte_size": total_bytes,
                 "filename": f"{bank_id}-bank.zip",
             }
             async with acquire_with_retry(backend) as conn:
@@ -3325,9 +3401,14 @@ class MemoryEngine(MemoryEngineInterface):
 
         The archive never leaves this process — a clone is both halves of a
         transfer on one instance, so stashing it in file storage would only add a
-        round trip and a blob to clean up. Everything else is the transfer path
-        exactly as it stands, which is the point: a clone cannot drift from what
-        export/import do.
+        round trip and a blob to clean up.
+
+        Architecture note on clone vs export strategy:
+        Unlike external export which streams chunks across short-lived connections
+        to prevent connection pool starvation during long network transfers, a live
+        clone loads the source bank under a single read transaction (conn.transaction())
+        to maintain snapshot consistency and prevent point-in-time relational smears
+        while the source bank is actively being written to.
         """
         import json
 
@@ -3452,7 +3533,7 @@ class MemoryEngine(MemoryEngineInterface):
         """
         rows = await conn.fetch(
             f"""SELECT result_metadata FROM {table}
-                WHERE operation_type = 'export_documents'
+                WHERE operation_type IN ('export_documents', 'export_bank')
                   AND status IN ('completed', 'failed', 'cancelled')
                   AND updated_at < $1
                 ORDER BY updated_at, operation_id
@@ -3749,7 +3830,7 @@ class MemoryEngine(MemoryEngineInterface):
                     await conn.execute(
                         f"""
                         UPDATE {fq_table("async_operations")}
-                        SET status = 'completed', updated_at = NOW(), completed_at = NOW()
+                        SET status = 'completed', error_message = NULL, updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1
                         """,
                         uuid.UUID(operation_id),
@@ -4790,7 +4871,7 @@ class MemoryEngine(MemoryEngineInterface):
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
-                        SET status = 'completed', updated_at = NOW(), completed_at = NOW()
+                        SET status = 'completed', error_message = NULL, updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
                         RETURNING operation_id
                         """,
@@ -4962,7 +5043,7 @@ class MemoryEngine(MemoryEngineInterface):
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
-                        SET status = 'completed', updated_at = NOW(), completed_at = NOW()
+                        SET status = 'completed', error_message = NULL, updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
                         RETURNING operation_id
                         """,
@@ -5013,7 +5094,7 @@ class MemoryEngine(MemoryEngineInterface):
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
-                        SET status = 'completed', updated_at = NOW(), completed_at = NOW()
+                        SET status = 'completed', error_message = NULL, updated_at = NOW(), completed_at = NOW()
                         WHERE operation_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
                         RETURNING operation_id
                         """,
@@ -5210,6 +5291,8 @@ class MemoryEngine(MemoryEngineInterface):
                     kwargs["username"] = self._pg0_username
                 if self._pg0_password is not None:
                     kwargs["password"] = self._pg0_password
+                if self._pg0_config is not None:
+                    kwargs["config"] = self._pg0_config
                 pg0 = EmbeddedPostgres(**kwargs)
                 # Check if pg0 is already running before we start it
                 was_already_running = await pg0.is_running()
@@ -7285,19 +7368,22 @@ class MemoryEngine(MemoryEngineInterface):
             task_payload=task_payload,
         )
 
-    async def retrieve_bank_file(
+    async def retrieve_bank_file_stream(
         self,
         bank_id: str,
         storage_key: str,
         request_context: "RequestContext",
-    ) -> bytes | None:
-        """Retrieve a bank-scoped stored file (e.g. an async export archive).
+    ) -> BankFileStream | None:
+        """Stream a bank-scoped stored file (e.g. an async export archive).
 
         Authorizes the caller against ``bank_id`` first (via ``get_bank_profile``,
         which authenticates the tenant), so a caller can't read another tenant's or
         bank's file even if they guess the key. Returns ``None`` when the bank is
         not visible to the caller or the file does not exist — the handler maps
         both to 404 (indistinguishable on purpose, so keys can't be probed).
+
+        Returns a BankFileStream holding the byte stream and file size in bytes
+        (where size may be None if unknown).
         """
         profile = await self.get_bank_profile(bank_id, request_context=request_context)
         if profile is None:
@@ -7309,10 +7395,10 @@ class MemoryEngine(MemoryEngineInterface):
         if not storage_key.startswith((bank_storage_prefix(bank_id), f"banks/{bank_id}/")):
             return None
         await self._get_backend()
-        try:
-            return await self._file_storage.retrieve(storage_key)
-        except FileNotFoundError:
+        if not await self._file_storage.exists(storage_key):
             return None
+        size = await self._file_storage.get_size(storage_key)
+        return BankFileStream(stream=self._file_storage.retrieve_stream(storage_key), size=size)
 
     async def _retain_attachment_info(
         self,
@@ -7682,7 +7768,7 @@ class MemoryEngine(MemoryEngineInterface):
         Returns ``None`` both when the bank is not visible to the caller and when
         the image does not exist — indistinguishable on purpose, so a caller
         cannot probe for which images a bank holds. Same guarantee as
-        :meth:`retrieve_bank_file`, and the reason the id alone is not a
+        :meth:`retrieve_bank_file_stream`, and the reason the id alone is not a
         capability: it is derived from the content, so anyone holding the same
         image could otherwise read whether some bank had also retained it.
         """
@@ -9168,6 +9254,9 @@ class MemoryEngine(MemoryEngineInterface):
             rerank_span.set_attribute("hindsight.candidates_count", len(merged_candidates))
 
             scored_results: list = []
+            # Provider that produced scored_results for THIS call. None until a
+            # cross-encoder rerank returns; rrf/interleave never consult it.
+            served_provider: str | None = None
             pre_filtered_count = 0
             rerank_kind = "cross-encoder"
             try:
@@ -9180,16 +9269,16 @@ class MemoryEngine(MemoryEngineInterface):
                     if reranker_max_candidates is not None
                     else get_config().reranker_max_candidates
                 )
-                if len(merged_candidates) > max_candidates:
-                    # Sort by RRF score (boosted per-strategy if configured) and take top
-                    # candidates. The rank-space boost reaches deeper into a boosted arm
-                    # before the cut without displacing the head of the other arms (#3956).
-                    from .search.recall_boost import boosted_rrf_score
+                # Sort by RRF score (boosted per-strategy if configured) and take top
+                # candidates only when the pool exceeds the cap. Under the cap the boost
+                # does not run and rrf_score is left as fusion wrote it (#3956, #4008).
+                from .search.recall_boost import trim_merged_candidates
 
-                    strategy_boosts = get_config().recall_strategy_boosts
-                    merged_candidates.sort(key=lambda mc: boosted_rrf_score(mc, strategy_boosts), reverse=True)
-                    pre_filtered_count = len(merged_candidates) - max_candidates
-                    merged_candidates = merged_candidates[:max_candidates]
+                strategy_boosts = get_config().recall_strategy_boosts
+                trimmed = trim_merged_candidates(merged_candidates, max_candidates, strategy_boosts)
+                merged_candidates = trimmed.kept
+                pre_filtered_count = trimmed.dropped
+                if pre_filtered_count > 0:
                     # Surface the cut in the trace: which arms actually made it into
                     # the reranker's budget, and whether a boost shaped that. Ranking
                     # complaints land on the trace first, and without this the boost
@@ -9244,7 +9333,12 @@ class MemoryEngine(MemoryEngineInterface):
 
                     # Ensure reranker is initialized (for lazy initialization mode)
                     await reranker_instance.ensure_initialized()
-                    scored_results = await reranker_instance.rerank(query, merged_candidates)
+                    reranked = await reranker_instance.rerank(query, merged_candidates)
+                    scored_results = reranked.results
+                    # Copied off the call that produced these scores. Do not read
+                    # cross_encoder.provider_name here: on a failover chain that
+                    # property follows a cursor other requests can move.
+                    served_provider = reranked.provider_name
                 else:
                     # "rrf" / "interleave": skip the cross-encoder and keep the fusion order
                     # (rrf_score is descending by fusion position for both). The cross-encoder
@@ -9294,9 +9388,12 @@ class MemoryEngine(MemoryEngineInterface):
                     sr.weight = sr.candidate.rrf_score
                 log_buffer.append("  [4.6] Interleave order preserved (combined scoring skipped)")
             elif scored_results:
-                ce = reranker_instance.cross_encoder
-                # "rrf" mode is passthrough by construction; so is a configured "rrf" CE.
-                is_passthrough = (reranking == "rrf") or (ce is not None and ce.provider_name == "rrf")
+                # "rrf" mode is passthrough by construction. A cross-encoder path is
+                # passthrough only when the member that served THIS rerank was rrf
+                # (a configured rrf provider, or the failover member that answered).
+                from .search.recall_boost import stage2_passthrough
+
+                is_passthrough = stage2_passthrough(reranking, served_provider)
                 scoring_config = get_config()
                 apply_combined_scoring(
                     scored_results,
@@ -9306,18 +9403,20 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
                     recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
                 )
-                # Per-strategy additive boost: nudge candidates surfaced by a
-                # prioritised retrieval arm up the final ordering.
+                # Per-strategy bump after combined scoring. Passthrough recalls
+                # (explicit rrf, an rrf provider, or a chain that failed over to
+                # rrf) skip the add: there is no cross-encoder score to correct,
+                # and a flat add on the RRF-seeded weight reorders the list (#4008).
                 strategy_boosts = get_config().recall_strategy_boosts
+                stage2: str | None = None
                 if strategy_boosts:
-                    from .search.recall_boost import additive_strategy_boost
+                    from .search.recall_boost import apply_post_rerank_boost
 
-                    for sr in scored_results:
-                        sr.weight += additive_strategy_boost(sr.candidate.source_ranks, strategy_boosts)
+                    stage2 = apply_post_rerank_boost(scored_results, strategy_boosts, passthrough=is_passthrough)
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
                 log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
                 if strategy_boosts:
-                    log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts}")
+                    log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts} {stage2}")
 
             # Step 4.9: post-query min_scores filters (reranker + final). The
             # semantic/text floors are applied earlier inside the SQL arms (see
@@ -10015,10 +10114,7 @@ class MemoryEngine(MemoryEngineInterface):
             # interleave modes, or the RRFPassthroughCrossEncoder), since its
             # cross_encoder_score_normalized is then a rank-derived placeholder, not a
             # true relevance score.
-            ce_model = self._cross_encoder_reranker.cross_encoder
-            reranker_passthrough = (reranking != "cross_encoder") or (
-                ce_model is not None and getattr(ce_model, "provider_name", None) == "rrf"
-            )
+            reranker_passthrough = (reranking != "cross_encoder") or served_provider == "rrf"
             scores_by_id: dict[str, RecallScores] = {
                 sr.id: RecallScores(
                     final=sr.weight,
@@ -10668,6 +10764,7 @@ class MemoryEngine(MemoryEngineInterface):
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 from .memories import MemoryPatch, get_memories
+                from .memories.base import META_OBSERVATION_SCOPES
                 from .retain.entity_labels import label_tag_keys, split_label_tags
 
                 _store = get_memories()
@@ -10776,9 +10873,14 @@ class MemoryEngine(MemoryEngineInterface):
                     )
                     _doc_units = _doc_page.memories
                     if _doc_units:
-                        await _store.update_memories(
-                            bank_id, [MemoryPatch(unit_id=m.unit_id, tags=_retagged(m.tags)) for m in _doc_units]
-                        )
+                        _patches = []
+                        for m in _doc_units:
+                            _patch = MemoryPatch(unit_id=m.unit_id, tags=_retagged(m.tags))
+                            _scopes = _renamed_scopes(m.observation_scopes, current_tags, retag)
+                            if _scopes != _normalize_scopes(m.observation_scopes):
+                                _patch.metadata = {META_OBSERVATION_SCOPES: json.dumps(_scopes)}
+                            _patches.append(_patch)
+                        await _store.update_memories(bank_id, _patches)
                     _src_ids = [m.unit_id for m in _doc_units if m.fact_type in ("experience", "world")]
                     if _src_ids:
                         invalidated_obs = await _store.delete_stale_observations(
@@ -10791,11 +10893,24 @@ class MemoryEngine(MemoryEngineInterface):
                     # `tags` as well as `id`: the projection each unit must keep is read
                     # here, before the blanket write below overwrites it.
                     unit_rows = await conn.fetch(
-                        f"SELECT id, tags, fact_type FROM {fq_table('memory_units')} "
+                        f"SELECT id, tags, fact_type, observation_scopes FROM {fq_table('memory_units')} "
                         f"WHERE document_id = $1 AND bank_id = $2",
                         document_id,
                         bank_id,
                     )
+                    _by_scopes: dict[str, list] = {}
+                    for _row in unit_rows:
+                        _scopes = _renamed_scopes(_row["observation_scopes"], current_tags, retag)
+                        if _scopes != _normalize_scopes(_row["observation_scopes"]):
+                            _by_scopes.setdefault(json.dumps(_scopes), []).append(_row["id"])
+                    for _scopes_json, _ids in _by_scopes.items():
+                        await conn.execute(
+                            f"UPDATE {fq_table('memory_units')} SET observation_scopes = $1 "
+                            f"WHERE bank_id = $2 AND id = ANY($3::uuid[])",
+                            _scopes_json,
+                            bank_id,
+                            _ids,
+                        )
                     unit_ids = [str(row["id"]) for row in unit_rows if row["fact_type"] in ("experience", "world")]
 
                     await conn.execute(
@@ -12083,6 +12198,10 @@ class MemoryEngine(MemoryEngineInterface):
             dt = datetime.fromisoformat(value)
             return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
+        doing_edit = any(
+            v is not None for v in (text, context, occurred_start, occurred_end, new_fact_type, new_entities)
+        )
+
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             from hindsight_api.extensions import BankWriteContext, BankWriteOperation
@@ -12091,6 +12210,18 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankWriteOperation.UPDATE_MEMORY_UNIT, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
+
+            from hindsight_api.extensions import MemoryUpdateContext
+
+            update_ctx = MemoryUpdateContext(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                request_context=request_context,
+                text=text,
+                state=state,
+                edits_fields=doing_edit,
+            )
+            await self._validate_operation(self._operation_validator.validate_memory_update(update_ctx))
 
         backend = await self._get_backend()
         from .graph_maintenance import enqueue_entity_prune_candidates, enqueue_relink_victims
@@ -12152,9 +12283,6 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
             # --- Edit fields (live rows only): text / context / dates / fact_type / entities ---
-            doing_edit = any(v is not None for v in (text, context, occurred_start, occurred_end, new_fact_type)) or (
-                new_entities is not None
-            )
             if doing_edit:
                 if not live:
                     raise ValueError("Cannot edit an invalidated memory; revert it to 'valid' first.")
@@ -12301,6 +12429,10 @@ class MemoryEngine(MemoryEngineInterface):
         # -- Phase 2: short write transaction -- all visible mutations atomic --
         phase2_committed = False
         edit_applied = False
+        # What the curation actually did, for the post-operation hook: the committed
+        # action and the text it re-embedded (None when nothing was re-embedded).
+        curation_action: MemoryCurationAction | None = None
+        reembedded_text: str | None = None
         try:
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
@@ -12409,6 +12541,8 @@ class MemoryEngine(MemoryEngineInterface):
                         need_consolidation = True
                         need_graph = True
                         edit_applied = True
+                        curation_action = "edit"
+                        reembedded_text = edit_plan.new_text
 
                     # --- Invalidate: move live → archive ---
                     if do_invalidate and live2:
@@ -12429,11 +12563,13 @@ class MemoryEngine(MemoryEngineInterface):
                         await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
                         need_consolidation = True
                         need_graph = True
+                        curation_action = "invalidate"
                     elif do_reason_update and archived2 and reason is not None:
                         # Already archived — just update the recorded reason.
                         await store.set_invalidation_reason(
                             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid), reason=reason
                         )
+                        curation_action = "reason"
 
                     # --- Revert: move archive → live ---
                     elif do_revert and archived2 and revert_plan is not None:
@@ -12465,6 +12601,8 @@ class MemoryEngine(MemoryEngineInterface):
                                     unit_id=str(memory_uuid),
                                     embedding=revert_embedding,
                                 )
+                            curation_action = "revert"
+                            reembedded_text = restored.text if revert_embedding is not None else None
                         need_consolidation = True
                         need_graph = True
 
@@ -12488,11 +12626,13 @@ class MemoryEngine(MemoryEngineInterface):
                 except Exception as e:
                     logger.warning(f"Failed to submit orphan-entity cleanup after a failed edit in bank {bank_id}: {e}")
 
+        consolidation_submitted = False
         if need_consolidation:
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
+                    consolidation_submitted = True
                 except Exception as e:
                     logger.warning(f"Failed to submit consolidation after curating memory in bank {bank_id}: {e}")
         if need_graph:
@@ -12511,6 +12651,23 @@ class MemoryEngine(MemoryEngineInterface):
             # pending, which is the common case: the survivors are about to be
             # re-consolidated and that path checks the same thing.
             await self._submit_refreshes_for_retracted_grounding(bank_id, request_context=request_context)
+
+        if self._operation_validator and phase2_committed and curation_action is not None:
+            from hindsight_api.extensions import MemoryUpdateResult
+
+            result_ctx = MemoryUpdateResult(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                request_context=request_context,
+                action=curation_action,
+                reembedded_text=reembedded_text,
+                reembedded_tokens=count_tokens(reembedded_text) if reembedded_text else 0,
+                consolidation_submitted=consolidation_submitted,
+            )
+            try:
+                await self._operation_validator.on_memory_update_complete(result_ctx)
+            except Exception as hook_err:
+                logger.warning(f"Post-memory-update hook error (non-fatal): {hook_err}")
 
         return await self.get_memory_unit(bank_id=bank_id, memory_id=memory_id, request_context=request_context)
 
@@ -12985,7 +13142,7 @@ class MemoryEngine(MemoryEngineInterface):
     async def extract_dry_run(
         self,
         bank_id: str,
-        content: str,
+        content: str | list[ContentBlockItem],
         *,
         context: str = "",
         event_date: "datetime | None" = None,
@@ -13003,7 +13160,7 @@ class MemoryEngine(MemoryEngineInterface):
         in ``context`` instead) but still overrides the narrator when supplied, for backwards compatibility.
         Side-effect-free and idempotent.
         """
-        from .response_models import ExtractedFact, ExtractionChunk
+        from .response_models import ExtractedFact, ExtractedFactAttachment, ExtractionChunk
         from .retain import fact_extraction
 
         # Resolve the tenant schema before touching any bank-scoped data (config).
@@ -13023,6 +13180,29 @@ class MemoryEngine(MemoryEngineInterface):
                 )
             setattr(resolved_config, key, value)
 
+        canonical = validate_and_canonicalize_content(
+            content,
+            max_attachment_count=resolved_config.retain_attachment_max_count,
+            max_attachment_size_bytes=resolved_config.retain_attachment_max_size_bytes,
+            max_attachment_size_mb=resolved_config.retain_attachment_max_size_mb,
+        )
+
+        attachment_loader = None
+        if canonical.has_attachments:
+            self._require_vision_capable_retain_llm()
+            from .retain.attachment_store import InMemoryAttachmentLoader
+
+            loaded_map: dict[str, LoadedAttachment] = {}
+            for att in canonical.attachments:
+                sid = short_attachment_id(att.attachment_hash)
+                loaded_map[sid] = LoadedAttachment(
+                    media_type=att.media_type,
+                    data=att.data,
+                    kind=att.kind,
+                    filename=att.filename,
+                )
+            attachment_loader = InMemoryAttachmentLoader(loaded_map)
+
         # chunks mode never reaches an LLM in a real retain — each chunk is stored as
         # its own memory verbatim — and the branch that does that lives in
         # `extract_facts_from_contents`, which this path does not go through. Without
@@ -13032,9 +13212,13 @@ class MemoryEngine(MemoryEngineInterface):
             from .retain.types import RetainContent
 
             chunked = fact_extraction._extract_facts_chunks(
-                [RetainContent(content=content, context=context, event_date=event_date)],
+                [RetainContent(content=canonical.text, context=context, event_date=event_date)],
                 resolved_config,
             )
+            chunk_occurrences = occurrences_by_chunk(
+                [chunk.chunk_text for chunk in chunked.chunks], canonical.occurrences
+            )
+
             chunk_of = self._chunk_index_per_fact([c.fact_count for c in chunked.chunks], len(chunked.facts))
             return DryRunExtractionResult(
                 facts=[
@@ -13048,10 +13232,24 @@ class MemoryEngine(MemoryEngineInterface):
                         occurred_end=fact.occurred_end,
                         entities=list(fact.entities or []),
                         chunk_index=chunk_of[i],
+                        attachments=[
+                            ExtractedFactAttachment(
+                                block_index=att.block_index,
+                                type=att.kind,
+                                media_type=att.media_type,
+                            )
+                            for att in (chunk_occurrences[chunk_of[i]] if chunk_of[i] is not None else [])
+                        ],
                     )
                     for i, fact in enumerate(chunked.facts)
                 ],
-                chunks=[ExtractionChunk(text=c.chunk_text, fact_count=c.fact_count) for c in chunked.chunks],
+                chunks=[
+                    ExtractionChunk(
+                        text=render_chunk_placeholders(c.chunk_text, chunk_occurrences[idx]),
+                        fact_count=c.fact_count,
+                    )
+                    for idx, c in enumerate(chunked.chunks)
+                ],
                 usage=chunked.usage,
             )
 
@@ -13060,32 +13258,55 @@ class MemoryEngine(MemoryEngineInterface):
         # derives a narrator from it either, so a dry run must mirror what retain would do.
         retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
         facts, chunks, usage = await fact_extraction.extract_facts_from_text(
-            text=content,
+            text=canonical.text,
             event_date=event_date,
             llm_config=retain_llm,
             vlm_config=self._vlm_config,
             config=resolved_config,
             context=context,
             agent_name=agent_name,
+            attachment_loader=attachment_loader,
         )
 
+        chunk_occurrences = occurrences_by_chunk([text for text, _ in chunks], canonical.occurrences)
+
         chunk_of = self._chunk_index_per_fact([count for _, count in chunks], len(facts))
-        extracted = [
-            ExtractedFact(
-                text=fact.fact,
-                fact_type=fact.fact_type,
-                occurred_start=fact.occurred_start,
-                occurred_end=fact.occurred_end,
-                entities=list(fact.entities or []),
-                chunk_index=chunk_of[i],
+        extracted = []
+        for i, fact in enumerate(facts):
+            chunk_idx = chunk_of[i]
+            cur_occs = chunk_occurrences[chunk_idx] if chunk_idx is not None else []
+            fact_attachments = [
+                ExtractedFactAttachment(
+                    block_index=occ.block_index,
+                    type=occ.kind,
+                    media_type=occ.media_type,
+                )
+                for occ in select_occurrences(fact.from_attachments or [], cur_occs)
+            ]
+
+            extracted.append(
+                ExtractedFact(
+                    text=fact.fact,
+                    fact_type=fact.fact_type,
+                    occurred_start=fact.occurred_start,
+                    occurred_end=fact.occurred_end,
+                    entities=list(fact.entities or []),
+                    chunk_index=chunk_idx,
+                    attachments=fact_attachments,
+                )
             )
-            for i, fact in enumerate(facts)
-        ]
+
         return DryRunExtractionResult(
             facts=extracted,
             # The LLM path returns (text, fact_count) pairs; the chunks path returns
             # ChunkMetadata objects. Same information, two shapes.
-            chunks=[ExtractionChunk(text=text, fact_count=count) for text, count in chunks],
+            chunks=[
+                ExtractionChunk(
+                    text=render_chunk_placeholders(text, chunk_occurrences[idx]),
+                    fact_count=count,
+                )
+                for idx, (text, count) in enumerate(chunks)
+            ],
             usage=usage,
         )
 
@@ -13907,7 +14128,7 @@ class MemoryEngine(MemoryEngineInterface):
     _LLM_REQUEST_COLUMNS = (
         "id, bank_id, operation, scope, trace_id, span_id, parent_span_id, "
         "provider, model, status, started_at, ended_at, duration_ms, "
-        "input_tokens, output_tokens, cached_tokens, total_tokens, "
+        "input_tokens, output_tokens, cached_tokens, thoughts_tokens, total_tokens, "
         "input, output, error, llm_info, metadata"
     )
 
@@ -13931,6 +14152,7 @@ class MemoryEngine(MemoryEngineInterface):
             input_tokens=row["input_tokens"],
             output_tokens=row["output_tokens"],
             cached_tokens=row["cached_tokens"],
+            thoughts_tokens=row["thoughts_tokens"],
             total_tokens=row["total_tokens"],
             input=conn.parse_json(row["input"]) if row["input"] is not None else None,
             output=conn.parse_json(row["output"]) if row["output"] is not None else None,
@@ -14130,6 +14352,7 @@ class MemoryEngine(MemoryEngineInterface):
                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
                        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                       COALESCE(SUM(thoughts_tokens), 0) AS thoughts_tokens,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                 FROM {table}
                 WHERE {where_sql}
@@ -14149,13 +14372,14 @@ class MemoryEngine(MemoryEngineInterface):
             key = row["bucket"].isoformat()
             if key not in statuses_by_bucket:
                 statuses_by_bucket[key] = {}
-                tokens_by_bucket[key] = {"input": 0, "output": 0, "cached": 0, "total": 0}
+                tokens_by_bucket[key] = {"input": 0, "output": 0, "cached": 0, "thoughts": 0, "total": 0}
                 order.append(key)
             statuses_by_bucket[key][row["status"]] = row["count"]
             tok = tokens_by_bucket[key]
             tok["input"] += row["input_tokens"]
             tok["output"] += row["output_tokens"]
             tok["cached"] += row["cached_tokens"]
+            tok["thoughts"] += row["thoughts_tokens"]
             tok["total"] += row["total_tokens"]
 
         return LLMRequestStatsResponse(
@@ -19719,8 +19943,8 @@ class MemoryEngine(MemoryEngineInterface):
         Fuses a full-text (BM25) match over the page name + content with vector
         similarity (``mm.embedding``) using Reciprocal Rank Fusion, in a single
         round trip. No reranker — this path is tuned for latency. Returns pages
-        ranked by fused score, each with a short content snippet. Folders are
-        excluded.
+        ranked by fused score, each with its ``source_query`` (the question it
+        answers) and a short content snippet. Folders are excluded.
 
         ``score`` is normalized to ``0..1``, where 1.0 is the best a page can do
         on this query: every arm at rank 1. It is a *rank* score, not a relevance
@@ -19793,7 +20017,7 @@ class MemoryEngine(MemoryEngineInterface):
                 rows = await conn.fetch(
                     f"""
                     SELECT kp.id, kp.name, kp.mental_model_id,
-                           LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at
+                           LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at
                     FROM {join}
                     WHERE kp.bank_id = $1 AND kp.kind = 'page' AND kp.mental_model_id = ANY($2::text[])
                     """,
@@ -19808,6 +20032,7 @@ class MemoryEngine(MemoryEngineInterface):
                     "id": r["id"],
                     "name": r["name"],
                     "mental_model_id": r["mental_model_id"],
+                    "source_query": r["source_query"],
                     "snippet": _knowledge_snippet(r["snippet"]),
                     # Same normalized single-arm RRF curve as the SQL paths below, so a
                     # store-owned bank's scores mean what a Postgres-ranked bank's do.
@@ -19850,7 +20075,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # Vector-only: no BM25 arm to fuse with, so rank straight off the ANN scan.
                 sql = f"""
                     SELECT kp.id, kp.name, kp.mental_model_id,
-                           LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at,
+                           LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at,
                            {_KNOWLEDGE_RRF_NORM} / ({_KNOWLEDGE_RRF_K} + ROW_NUMBER() OVER (ORDER BY mm.embedding <=> $1::vector)) AS score
                     FROM {join}
                     WHERE kp.bank_id = $2 AND kp.kind = 'page' AND mm.embedding IS NOT NULL
@@ -19914,7 +20139,7 @@ class MemoryEngine(MemoryEngineInterface):
                             FROM vec FULL OUTER JOIN bm ON vec.page_id = bm.page_id
                         )
                         SELECT kp.id, kp.name, kp.mental_model_id,
-                               LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at, f.score
+                               LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at, f.score
                         FROM fused f
                         JOIN {kp} kp ON kp.id = f.page_id AND kp.bank_id = $2
                         LEFT JOIN {mm} mm ON mm.id = kp.mental_model_id AND mm.bank_id = kp.bank_id
@@ -19938,7 +20163,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # rank does, so the same normalized RRF curve is applied here too.
                     sql = f"""
                         SELECT kp.id, kp.name, kp.mental_model_id,
-                               LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at,
+                               LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at,
                                {_KNOWLEDGE_RRF_NORM} / ({_KNOWLEDGE_RRF_K} + ROW_NUMBER() OVER (ORDER BY {bm25.order_by})) AS score
                         FROM {join}
                         WHERE kp.bank_id = $1 AND kp.kind = 'page'
@@ -19953,6 +20178,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "id": r["id"],
                 "name": r["name"],
                 "mental_model_id": r["mental_model_id"],
+                "source_query": r["source_query"],
                 "snippet": _knowledge_snippet(r["snippet"]),
                 "score": float(r["score"]) if r["score"] is not None else 0.0,
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
@@ -21195,6 +21421,9 @@ class MemoryEngine(MemoryEngineInterface):
                     {
                         "id": str(row["operation_id"]),
                         "task_type": row["operation_type"],
+                        # Same names the single-operation read uses (#4858).
+                        "operation_id": str(row["operation_id"]),
+                        "operation_type": row["operation_type"],
                         "items_count": result_metadata.get("items_count", 0),
                         "document_id": result_metadata.get("document_id"),
                         "filename": result_metadata.get("original_filename"),
@@ -21334,6 +21563,10 @@ class MemoryEngine(MemoryEngineInterface):
                         "operation_id": operation_id,
                         "status": api_status,
                         "operation_type": row["operation_type"],
+                        # Same names the list uses, so one client model reads both (#4858).
+                        "id": operation_id,
+                        "task_type": row["operation_type"],
+                        "mental_model_id": result_metadata.get("mental_model_id"),
                         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                         "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
@@ -21352,6 +21585,10 @@ class MemoryEngine(MemoryEngineInterface):
                         "operation_id": operation_id,
                         "status": api_status,
                         "operation_type": row["operation_type"],
+                        # Same names the list uses, so one client model reads both (#4858).
+                        "id": operation_id,
+                        "task_type": row["operation_type"],
+                        "mental_model_id": result_metadata.get("mental_model_id"),
                         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                         "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
@@ -21369,6 +21606,8 @@ class MemoryEngine(MemoryEngineInterface):
                     "operation_id": operation_id,
                     "status": "not_found",
                     "operation_type": None,
+                    "id": operation_id,
+                    "task_type": None,
                     "created_at": None,
                     "updated_at": None,
                     "completed_at": None,
@@ -22072,6 +22311,7 @@ class MemoryEngine(MemoryEngineInterface):
         dedupe_excludes_operation_id: str | None = None,
         dedupe_in_flight_payload_key: str | None = None,
         dedupe_in_flight_includes_processing: bool = True,
+        serialization_key: str | None = None,
     ) -> dict[str, Any]:
         """Generic helper to submit an async operation.
 
@@ -22098,6 +22338,11 @@ class MemoryEngine(MemoryEngineInterface):
                 counts for dedupe_in_flight_payload_key, on top of a pending one. False keeps the
                 guarantee to "at most one pending", which is all that a submit carrying new intent
                 (an explicit refresh after an edit) can safely fold into.
+            serialization_key: Written to the row's ``serialization_key`` column, which the claim
+                query serialises on: at most one operation per (bank, key) runs at a time, and the
+                oldest claimable pending peer goes first (see ``key_serialization_sql``). Dedupe
+                decides whether a *row* is created; this decides whether a created row may run
+                beside its peers. Leave None for work whose runs are independent.
 
         Returns:
             Dict with operation_id and optionally deduplicated=True if an existing task was found
@@ -22293,8 +22538,10 @@ class MemoryEngine(MemoryEngineInterface):
                         }
                 await conn.execute(
                     f"""
-                    INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload)
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    INSERT INTO {fq_table("async_operations")}
+                        (operation_id, bank_id, operation_type, result_metadata, status,
+                         task_payload, serialization_key)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
                     """,
                     operation_id,
                     bank_id,
@@ -22302,6 +22549,7 @@ class MemoryEngine(MemoryEngineInterface):
                     json.dumps(result_metadata or {}, default=_json_default),
                     "pending",
                     json.dumps(full_payload, default=_json_default),
+                    serialization_key,
                 )
 
         # For SyncTaskBackend: executes the task immediately.
@@ -23206,6 +23454,14 @@ class MemoryEngine(MemoryEngineInterface):
                 floor, any submit path that forgets this flag piles up unbounded pending
                 copies on a bank whose refresh queue drains slower than it fills.
 
+        Rows are also serialised per model at claim time: the operation carries
+        ``serialization_key = mental_model:<id>``, so a bank runs at most one refresh
+        per model at a time. Dedupe alone does not give that — it only bounds the
+        *queue*, and a refresh queued behind a running one used to be claimed
+        immediately and write the same model beside it, where whichever finished last
+        won regardless of which read more. Models are independent, so a bank with
+        hundreds of them keeps refreshing them in parallel.
+
         Returns:
             Dict with operation_id — the surviving operation's when this submit was
             suppressed, together with ``deduplicated=True``, so the caller can poll
@@ -23262,6 +23518,7 @@ class MemoryEngine(MemoryEngineInterface):
             dedupe_by_bank=False,
             dedupe_in_flight_payload_key="mental_model_id",
             dedupe_in_flight_includes_processing=skip_if_in_flight,
+            serialization_key=refresh_serialization_key(mental_model_id),
         )
 
         # An explicit refresh that folded into a queued automatic one inherits its park.

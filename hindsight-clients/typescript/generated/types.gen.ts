@@ -1440,6 +1440,25 @@ export type ConsolidationStrategySpec = {
 };
 
 /**
+ * Content
+ *
+ * The raw content to retain or extract from. Either a plain string or an ordered list of content blocks.
+ */
+export type Content =
+  | string
+  | Array<
+      | ({
+          type: "text";
+        } & TextContentBlock)
+      | ({
+          type: "image";
+        } & ImageContentBlock)
+      | ({
+          type: "file";
+        } & FileContentBlock)
+    >;
+
+/**
  * CreateBankAliasRequest
  *
  * Request model for adding an alias to a bank.
@@ -2177,11 +2196,9 @@ export type DocumentResponse = {
  */
 export type DryRunExtractRequest = {
   /**
-   * Content
-   *
-   * Text to extract facts from (e.g. a document or a single chunk).
+   * The raw content to extract facts from. Either a plain string, or an ordered list of content blocks (text, image, file) so images/attachments sit inline where they actually appear.
    */
-  content: string;
+  content: Content;
   /**
    * Context
    *
@@ -2618,6 +2635,38 @@ export type ExtractedFact = {
    * Index into `chunks` of the chunk this fact came from; null if it could not be attributed.
    */
   chunk_index?: number | null;
+  /**
+   * Attachments
+   *
+   * Attachments from user input that this fact is attributed to / associated with.
+   */
+  attachments?: Array<ExtractedFactAttachment>;
+};
+
+/**
+ * ExtractedFactAttachment
+ *
+ * An attachment from multimodal input associated with an extracted fact.
+ */
+export type ExtractedFactAttachment = {
+  /**
+   * Block Index
+   *
+   * Index of the content block in user's input (0-based)
+   */
+  block_index: number;
+  /**
+   * AttachmentType
+   *
+   * Content block type ('image' or 'file')
+   */
+  type: "image" | "file";
+  /**
+   * Media Type
+   *
+   * MIME media type of the attachment, e.g. 'image/png'
+   */
+  media_type: string;
 };
 
 /**
@@ -2726,12 +2775,10 @@ export type FeaturesInfo = {
 /**
  * FileContentBlock
  *
- * A non-image attachment — a PDF, a spreadsheet — in the position it was written.
+ * A non-image attachment — a PDF, a spreadsheet — in its input position.
  *
- * Split from ``image`` rather than folded into one type because the providers
- * split it: Anthropic has distinct image and document blocks, OpenAI has
- * image_url and file parts. Carrying the caller's own distinction through means
- * the per-provider conversion never has to guess from the media type alone.
+ * This stays distinct from ``image`` because providers use different request
+ * parts for images and documents; retaining the caller's kind avoids guessing.
  */
 export type FileContentBlock = {
   /**
@@ -3021,6 +3068,12 @@ export type KnowledgePageSearchResult = {
    */
   mental_model_id?: string | null;
   /**
+   * Source Query
+   *
+   * The question the page answers.
+   */
+  source_query?: string | null;
+  /**
    * Snippet
    *
    * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
@@ -3140,6 +3193,10 @@ export type LlmRequestEntry = {
    * Cached Tokens
    */
   cached_tokens: number | null;
+  /**
+   * Thoughts Tokens
+   */
+  thoughts_tokens: number | null;
   /**
    * Total Tokens
    */
@@ -3267,6 +3324,10 @@ export type LlmRequestTokenSums = {
    * Cached
    */
   cached: number;
+  /**
+   * Thoughts
+   */
+  thoughts?: number | null;
   /**
    * Total
    */
@@ -3834,8 +3895,6 @@ export type MemoryGraphTableRow = {
  */
 export type MemoryItem = {
   /**
-   * Content
-   *
    * The raw content to retain. Either a plain string, or an ordered list of content blocks so images sit inline where they actually appear:
    *
    * [{"type": "text", "text": "click the button shown:"},
@@ -3844,19 +3903,7 @@ export type MemoryItem = {
    *
    * The block form requires a vision-capable retain LLM; a retain carrying images against a text-only model is rejected rather than silently dropping them. A single text block is equivalent to the plain string form.
    */
-  content:
-    | string
-    | Array<
-        | ({
-            type: "text";
-          } & TextContentBlock)
-        | ({
-            type: "image";
-          } & ImageContentBlock)
-        | ({
-            type: "file";
-          } & FileContentBlock)
-      >;
+  content: Content;
   /**
    * Timestamp
    *
@@ -4729,7 +4776,7 @@ export type MentalModelTriggerInput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -4839,7 +4886,7 @@ export type MentalModelTriggerOutput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -5054,6 +5101,18 @@ export type OperationResponse = {
    */
   task_type: string;
   /**
+   * Operation Id
+   *
+   * Same as `id`; the name the single-operation read uses.
+   */
+  operation_id?: string | null;
+  /**
+   * Operation Type
+   *
+   * Same as `task_type`; the name the single-operation read uses.
+   */
+  operation_type?: string | null;
+  /**
    * Items Count
    */
   items_count: number;
@@ -5070,7 +5129,7 @@ export type OperationResponse = {
   /**
    * Mental Model Id
    *
-   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata. The single-operation read exposes the same value under `result_metadata`.
+   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata.
    */
   mental_model_id?: string | null;
   /**
@@ -5131,6 +5190,24 @@ export type OperationStatusResponse = {
    * Operation Type
    */
   operation_type?: string | null;
+  /**
+   * Id
+   *
+   * Same as `operation_id`; the name the operations list uses.
+   */
+  id?: string | null;
+  /**
+   * Task Type
+   *
+   * Same as `operation_type`; the name the operations list uses.
+   */
+  task_type?: string | null;
+  /**
+   * Mental Model Id
+   *
+   * Mental model this operation acted on (refresh_mental_model); null for other task types.
+   */
+  mental_model_id?: string | null;
   /**
    * Created At
    */

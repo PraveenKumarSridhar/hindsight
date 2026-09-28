@@ -59,9 +59,15 @@ import type {
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
+  Base64AttachmentSource,
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,
@@ -1759,51 +1765,7 @@ export class HindsightClient {
       signal: options?.signal,
     });
     const submission = this.validateResponse(submitResponse, "exportDocuments");
-    const operationId = submission.operation_id;
-
-    const pollInterval = options?.pollIntervalMs ?? 2000;
-    const timeout = options?.timeoutMs ?? 300000;
-    const deadline = Date.now() + timeout;
-    let resultMetadata: Record<string, unknown> | null | undefined;
-    for (;;) {
-      const statusResponse = await sdk.getOperationStatus({
-        client: this.client,
-        path: { bank_id: bankId, operation_id: operationId },
-        signal: options?.signal,
-      });
-      const status = this.validateResponse(statusResponse, "getOperationStatus");
-      if (status.status === "completed") {
-        resultMetadata = status.result_metadata;
-        break;
-      }
-      if (status.status === "failed" || status.status === "cancelled") {
-        throw new HindsightError(
-          `Export operation ${operationId} ${status.status}: ${status.error_message ?? ""}`
-        );
-      }
-      if (Date.now() >= deadline) {
-        throw new HindsightError(
-          `Export operation ${operationId} did not complete within ${timeout}ms`
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    }
-
-    const downloadUrl = (resultMetadata as { download_url?: string } | null | undefined)
-      ?.download_url;
-    if (!downloadUrl) {
-      throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
-    }
-    // Fetch the server-provided download_url directly (it carries the raw,
-    // slash-bearing storage key). Going through the templated `downloadFile`
-    // would percent-encode the slashes, which fronting proxies often reject.
-    const downloadResponse = await this.client.get({
-      url: downloadUrl,
-      parseAs: "arrayBuffer",
-      signal: options?.signal,
-    });
-    const data = this.validateResponse(downloadResponse as { data?: ArrayBuffer }, "downloadFile");
-    return new Uint8Array(data);
+    return this.downloadOperationArchive(bankId, submission.operation_id, options);
   }
 
   /**
@@ -1976,6 +1938,15 @@ export class HindsightClient {
     if (!downloadUrl) {
       throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
     }
+    if (/^https?:\/\//i.test(downloadUrl)) {
+      // Signed object-store URLs need their own request: the API client prefixes
+      // its base URL and forwards Hindsight credentials to every request.
+      const response = await fetch(downloadUrl, { signal: options?.signal });
+      if (!response.ok) {
+        throw new HindsightError(`downloadFile failed: HTTP ${response.status}`, response.status);
+      }
+      return new Uint8Array(await response.arrayBuffer());
+    }
     // Fetch the server-provided download_url directly (it carries the raw,
     // slash-bearing storage key). Going through the templated `downloadFile`
     // would percent-encode the slashes, which fronting proxies often reject.
@@ -2036,6 +2007,10 @@ export function recallResponseToPromptString(response: RecallResponse): string {
 
 // Re-export types for convenience
 export type {
+  Base64AttachmentSource,
+  TextContentBlock,
+  ImageContentBlock,
+  FileContentBlock,
   RetainRequest,
   RetainResponse,
   RecallRequest,
@@ -2066,6 +2041,11 @@ export type {
   DirectiveListResponse,
   DirectiveResponse,
   DocumentResponse,
+  DryRunExtractRequest,
+  DryRunExtractionResult,
+  ExtractedFact,
+  ExtractedFactAttachment,
+  ExtractionChunk,
   KnowledgeNode,
   KnowledgePageBundleResponse,
   KnowledgePageResponse,
