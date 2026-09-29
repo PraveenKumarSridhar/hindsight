@@ -289,8 +289,12 @@ class MinScores(BaseModel):
     when the reranker that actually serves the request returns a pointwise or
     calibrated-probability score. A listwise/ordinal provider such as TypeSafe,
     and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor
-    would only select a fixed rank fraction. ``final`` remains available for
-    ordinal providers.
+    would only select a fixed rank fraction. Known ordinal configurations (an
+    explicit RRF/interleave mode, a single ordinal provider, or an all-ordinal
+    failover chain) reject the floor even when retrieval is empty. If retrieval
+    is empty for a mixed ordinal/pointwise failover chain, no member serves the
+    request, so recall returns an empty result without applying the floor.
+    ``final`` remains available for ordinal providers.
 
     Any field left None imposes no floor; all-None (the default) means no score
     filtering.
@@ -308,7 +312,7 @@ class MinScores(BaseModel):
     )
     reranker: float | None = Field(
         default=None,
-        description="Post-query: minimum normalized reranker score (0-1), applied to every returned result. Accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction.",
+        description="Post-query: minimum normalized reranker score (0-1), applied to every returned result. Accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction. Known ordinal configurations, including an explicit RRF/interleave mode, a single ordinal provider, or an all-ordinal failover chain, reject this floor even when retrieval is empty. If retrieval is empty for a mixed ordinal/pointwise failover chain, no member serves the request, so recall returns an empty result without applying the floor.",
     )
     final: float | None = Field(
         default=None,

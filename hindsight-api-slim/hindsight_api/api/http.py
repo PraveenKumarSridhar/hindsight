@@ -490,7 +490,11 @@ class RecallRequest(BaseModel):
         "`min_scores.reranker` is accepted only when the reranker that actually serves the request returns "
         "a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and "
         "RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a "
-        "fixed rank fraction. `min_scores.final` remains available for ordinal providers. "
+        "fixed rank fraction. Known ordinal configurations, including an explicit RRF/interleave mode, "
+        "a single ordinal provider, or an all-ordinal failover chain, reject this floor even when retrieval "
+        "is empty. If retrieval is empty for a mixed ordinal/pointwise failover chain, no member serves the "
+        "request, so recall returns an empty result without applying the floor. `min_scores.final` remains "
+        "available for ordinal providers. "
         "Any field left unset imposes no floor; omitting `min_scores` entirely "
         "(the default) applies no score filtering. Use with care — the reranker's absolute scores are not "
         "calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).",

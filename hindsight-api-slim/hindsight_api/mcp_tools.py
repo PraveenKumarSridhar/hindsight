@@ -1276,6 +1276,10 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                     both. "reranker"/"final" apply to every scored result, but "reranker" requires
                     pointwise or calibrated-probability scores from the provider that serves the request.
                     TypeSafe (ordinal) and RRF/interleave passthrough modes reject that floor.
+                    Known ordinal configurations (explicit RRF/interleave, a single ordinal provider, or an
+                    all-ordinal failover chain) reject it even when retrieval is empty. An empty mixed
+                    ordinal/pointwise failover chain returns empty without applying the floor because no member
+                    served the request.
                     "final" remains available for ordinal providers. Calibrate pointwise thresholds against
                     scores observed on your own data; absolute scores can vary across queries.
                 temporal_window: Window for the temporal arm as {"start": ISO, "end": ISO}, used instead of
@@ -1376,6 +1380,10 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                     both. "reranker"/"final" apply to every scored result, but "reranker" requires
                     pointwise or calibrated-probability scores from the provider that serves the request.
                     TypeSafe (ordinal) and RRF/interleave passthrough modes reject that floor.
+                    Known ordinal configurations (explicit RRF/interleave, a single ordinal provider, or an
+                    all-ordinal failover chain) reject it even when retrieval is empty. An empty mixed
+                    ordinal/pointwise failover chain returns empty without applying the floor because no member
+                    served the request.
                     "final" remains available for ordinal providers. Calibrate pointwise thresholds against
                     scores observed on your own data; absolute scores can vary across queries.
                 temporal_window: Window for the temporal arm as {"start": ISO, "end": ISO}, used instead of
