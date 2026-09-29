@@ -15,6 +15,7 @@ import pytest
 from hindsight_api.config import HindsightConfig
 from hindsight_api.engine.cross_encoder import (
     _OPTION_KEY_OVERHEAD,
+    JinaMLXCrossEncoder,
     RRFPassthroughCrossEncoder,
     ScoreSemantics,
     TypeSafeCrossEncoder,
@@ -126,6 +127,10 @@ def test_typesafe_declares_ordinal_scores() -> None:
 
 def test_rrf_passthrough_declares_ordinal_scores() -> None:
     assert RRFPassthroughCrossEncoder().score_semantics is ScoreSemantics.ORDINAL
+
+
+def test_jina_mlx_declares_listwise_scores() -> None:
+    assert JinaMLXCrossEncoder().score_semantics is ScoreSemantics.LISTWISE
 
 
 class TestRanking:

@@ -4957,14 +4957,13 @@ export type MentalModelTriggerOutput = {
  * result after fusion and reranking, so these *are* per-result predicates: a
  * returned result always clears them. ``min_scores.reranker`` is accepted only
  * when the reranker that actually serves the request returns a pointwise or
- * calibrated-probability score. A listwise/ordinal provider such as TypeSafe,
- * and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor
- * would only select a fixed rank fraction. Known ordinal configurations (an
- * explicit RRF/interleave mode, a single ordinal provider, or an all-ordinal
- * failover chain) reject the floor even when retrieval is empty. If retrieval
- * is empty for a mixed ordinal/pointwise failover chain, no member serves the
- * request, so recall returns an empty result without applying the floor.
- * ``final`` remains available for ordinal providers.
+ * calibrated-probability score. Pool-dependent providers, including TypeSafe's
+ * ordinal scores and Jina MLX's listwise scores, and RRF/interleave passthrough
+ * modes return HTTP 400. Known pool-dependent configurations reject the floor
+ * even when retrieval is empty. If retrieval is empty for a failover chain with
+ * a pointwise member, no member serves the request, so recall returns an empty
+ * result without applying the floor. ``final`` remains available for
+ * pool-dependent providers.
  *
  * Any field left None imposes no floor; all-None (the default) means no score
  * filtering.
@@ -4985,7 +4984,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1), applied to every returned result. Accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction. Known ordinal configurations, including an explicit RRF/interleave mode, a single ordinal provider, or an all-ordinal failover chain, reject this floor even when retrieval is empty. If retrieval is empty for a mixed ordinal/pointwise failover chain, no member serves the request, so recall returns an empty result without applying the floor.
+   * Post-query: minimum normalized reranker score (0-1), applied to every returned result. Accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. Pool-dependent providers, including TypeSafe's ordinal scores and Jina MLX's listwise scores, and RRF/interleave passthrough modes return HTTP 400. Known pool-dependent configurations reject this floor even when retrieval is empty. If retrieval is empty for a failover chain with a pointwise member, no member serves the request, so recall returns an empty result without applying the floor.
    */
   reranker?: number | null;
   /**
@@ -5540,7 +5539,7 @@ export type RecallRequest = {
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
-   * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned. `min_scores.reranker` is accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction. Known ordinal configurations, including an explicit RRF/interleave mode, a single ordinal provider, or an all-ordinal failover chain, reject this floor even when retrieval is empty. If retrieval is empty for a mixed ordinal/pointwise failover chain, no member serves the request, so recall returns an empty result without applying the floor. `min_scores.final` remains available for ordinal providers. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
+   * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned. `min_scores.reranker` is accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. Pool-dependent providers, including TypeSafe's ordinal scores and Jina MLX's listwise scores, and RRF/interleave passthrough modes return HTTP 400. Known pool-dependent configurations reject this floor even when retrieval is empty. If retrieval is empty for a failover chain with a pointwise member, no member serves the request, so recall returns an empty result without applying the floor. `min_scores.final` remains available for ordinal providers. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
    */
   min_scores?: MinScores | null;
   /**
@@ -5688,7 +5687,7 @@ export type RecallScores = {
   /**
    * Reranker
    *
-   * The reranker's normalized numeric score. For pointwise providers it belongs to the query-document pair. TypeSafe currently publishes an ordinal position for compatibility, so it is query-pool dependent and cannot be used with `min_scores.reranker`. None for RRF/interleave passthrough modes.
+   * The reranker's normalized numeric score. For pointwise providers it belongs to the query-document pair. TypeSafe's ordinal position and Jina MLX's listwise score depend on the candidate pool and cannot be used with `min_scores.reranker`. None for RRF/interleave passthrough modes.
    */
   reranker?: number | null;
   /**

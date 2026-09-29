@@ -140,6 +140,25 @@ async def test_empty_candidates_returns_empty_without_predict():
 
 
 @pytest.mark.asyncio
+async def test_duck_typed_cross_encoder_uses_legacy_capability_defaults() -> None:
+    class DuckTypedCrossEncoder:
+        provider_name = "custom"
+
+        async def initialize(self) -> None:
+            pass
+
+        async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [0.8] * len(pairs)
+
+    reranked = await CrossEncoderReranker(cross_encoder=DuckTypedCrossEncoder()).rerank(
+        "test query", _make_candidates(1)
+    )
+
+    assert reranked.served == ServedReranker("custom", ScoreSemantics.POINTWISE, False)
+    assert reranked.results[0].cross_encoder_score_normalized == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
 async def test_boundary_scores_passthrough():
     """Boundary values 0.0 and 1.0 (still in [0,1]) should pass through."""
     raw_scores = [0.0, 1.0, 0.5]

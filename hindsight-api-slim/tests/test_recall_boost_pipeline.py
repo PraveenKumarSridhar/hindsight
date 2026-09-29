@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 from typing import Literal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -59,6 +59,14 @@ class _Ordinal(CrossEncoderModel):
         return scores
 
 
+class _Listwise(_Primary):
+    score_semantics = ScoreSemantics.LISTWISE
+
+    @property
+    def provider_name(self) -> str:
+        return "jina-mlx"
+
+
 class _ConfigResolver:
     async def get_bank_config(self, _bank_id: str, _request_context: RequestContext) -> dict[str, object]:
         return {}
@@ -83,6 +91,7 @@ class _RecallHarness:
         *,
         reranking: Literal["cross_encoder", "rrf", "interleave"] = "cross_encoder",
         min_scores: MinScores | None = None,
+        enable_trace: bool = False,
     ) -> RecallResult:
         return await self.engine.recall_async(
             bank_id="test-bank",
@@ -92,6 +101,7 @@ class _RecallHarness:
             request_context=RequestContext(),
             reranking=reranking,
             min_scores=min_scores,
+            enable_trace=enable_trace,
             _quiet=True,
         )
 
@@ -183,11 +193,12 @@ async def test_min_final_filters_after_rank_decay(recall_harness: _RecallHarness
 
 
 @pytest.mark.asyncio
-async def test_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHarness) -> None:
+@pytest.mark.parametrize("floor", [0.0, 0.5, 1.0])
+async def test_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHarness, floor: float) -> None:
     recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
 
     with pytest.raises(OperationValidationError) as exc_info:
-        await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+        await recall_harness.recall(min_scores=MinScores(reranker=floor))
 
     assert exc_info.value.status_code == 400
     assert "min_scores.reranker" in exc_info.value.reason
@@ -243,7 +254,9 @@ async def test_explicit_ordinal_floor_is_rejected_before_store_full_recall(
     reranking: Literal["rrf", "interleave"],
 ) -> None:
     store = _ClaimingEmptyStore()
+    generate_embeddings = AsyncMock(return_value=[[0.1, 0.2, 0.3]])
     monkeypatch.setattr("hindsight_api.engine.memories.get_memories", lambda: store)
+    monkeypatch.setattr(memory_engine.embedding_utils, "generate_embeddings_batch", generate_embeddings)
 
     with pytest.raises(OperationValidationError) as exc_info:
         await recall_harness.recall(reranking=reranking, min_scores=MinScores(reranker=0.5))
@@ -252,6 +265,57 @@ async def test_explicit_ordinal_floor_is_rejected_before_store_full_recall(
     assert "min_scores.reranker" in exc_info.value.reason
     assert "ordinal" in exc_info.value.reason
     assert store.calls == 0
+    generate_embeddings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_listwise_reranker_floor_is_rejected(recall_harness: _RecallHarness) -> None:
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Listwise())
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "listwise" in exc_info.value.reason
+    assert "jina-mlx" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+async def test_served_provider_reaches_span_and_recall_trace(
+    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    otel_tracer = MagicMock()
+    recall_span = MagicMock()
+    span_context = MagicMock()
+    span_context.__enter__.return_value = recall_span
+    span_context.__exit__.return_value = False
+    otel_tracer.start_as_current_span.return_value = span_context
+    spans: dict[str, MagicMock] = {}
+
+    def start_span(name: str) -> MagicMock:
+        span = MagicMock()
+        spans[name] = span
+        return span
+
+    otel_tracer.start_span.side_effect = start_span
+    monkeypatch.setattr("hindsight_api.tracing.get_tracer", lambda: otel_tracer)
+
+    result = await recall_harness.recall(enable_trace=True)
+
+    rerank_attributes = {
+        call.args[0]: call.args[1] for call in spans["hindsight.recall_rerank"].set_attribute.call_args_list
+    }
+    assert rerank_attributes["hindsight.reranker_provider"] == "tei"
+    assert rerank_attributes["hindsight.score_semantics"] == "pointwise"
+    assert rerank_attributes["hindsight.reranker_prunes_candidates"] is False
+
+    assert result.trace is not None
+    rerank_phase = next(
+        phase for phase in result.trace["summary"]["phase_metrics"] if phase["phase_name"] == "reranking"
+    )
+    assert rerank_phase["details"]["reranker_provider"] == "tei"
+    assert rerank_phase["details"]["score_semantics"] == "pointwise"
+    assert rerank_phase["details"]["prunes_candidates"] is False
 
 
 async def _empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRetrievalResult:
@@ -269,16 +333,23 @@ async def _empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRe
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["typesafe", "rrf", "interleave", "rrf_provider", "ordinal_chain"])
-async def test_known_ordinal_empty_retrieval_rejects_reranker_floor(
+@pytest.mark.parametrize(
+    "mode",
+    ["typesafe", "jina", "rrf", "interleave", "rrf_provider", "ordinal_chain", "pool_dependent_chain"],
+)
+async def test_known_pool_dependent_empty_retrieval_rejects_reranker_floor(
     recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", _empty_retrieval)
     encoder: CrossEncoderModel = _Ordinal()
-    if mode == "rrf_provider":
+    if mode == "jina":
+        encoder = _Listwise()
+    elif mode == "rrf_provider":
         encoder = RRFPassthroughCrossEncoder()
     elif mode == "ordinal_chain":
         encoder = MultiCrossEncoder([_Ordinal(), RRFPassthroughCrossEncoder()])
+    elif mode == "pool_dependent_chain":
+        encoder = MultiCrossEncoder([_Ordinal(), _Listwise()])
     recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=encoder)
     reranking = {"rrf": "rrf", "interleave": "interleave"}.get(mode, "cross_encoder")
 
@@ -287,7 +358,29 @@ async def test_known_ordinal_empty_retrieval_rejects_reranker_floor(
 
     assert exc_info.value.status_code == 400
     assert "min_scores.reranker" in exc_info.value.reason
-    assert "ordinal" in exc_info.value.reason
+    expected_semantics = "listwise" if mode == "jina" else "ordinal"
+    assert expected_semantics in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["listwise", "pool_dependent_chain"])
+async def test_empty_pool_dependent_floor_is_rejected_before_reranker_initialization(
+    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", _empty_retrieval)
+    encoder: CrossEncoderModel = _Listwise()
+    if mode == "pool_dependent_chain":
+        encoder = MultiCrossEncoder([_Ordinal(), _Listwise()])
+    reranker = CrossEncoderReranker(cross_encoder=encoder)
+    reranker.ensure_initialized = AsyncMock(side_effect=RuntimeError("model load failed"))
+    recall_harness.engine._cross_encoder_reranker = reranker
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "pool" in exc_info.value.reason or "listwise" in exc_info.value.reason
+    reranker.ensure_initialized.assert_not_awaited()
 
 
 @pytest.mark.asyncio

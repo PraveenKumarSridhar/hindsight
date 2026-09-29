@@ -788,9 +788,9 @@ Setting `semantic` and `keyword` together therefore does not restrict the respon
 
 #### For abstention, use `reranker` or `final`
 
-The post-query floors are applied to every scored result after fusion and reranking, so a returned result always clears a floor it was allowed to set. A query where nothing clears it returns no results. `min_scores.reranker` is accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction. Failover is decided per request, so the same chain may accept or reject this floor depending on which member answers.
+The post-query floors are applied to every scored result after fusion and reranking, so a returned result always clears a floor it was allowed to set. A query where nothing clears it returns no results. `min_scores.reranker` is accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. Pool-dependent providers, including TypeSafe's ordinal scores and Jina MLX's listwise scores, and RRF/interleave passthrough modes return HTTP 400. Failover is decided per request, so the same chain may accept or reject this floor depending on which member answers.
 
-Known ordinal configurations, including an explicit RRF/interleave mode, a single ordinal provider such as TypeSafe, or an all-ordinal failover chain, reject the floor even when retrieval is empty. If retrieval is empty for a mixed ordinal/pointwise failover chain, no member serves the request, so recall returns an empty result without applying the floor.
+Known pool-dependent configurations, including an explicit RRF/interleave mode, TypeSafe, Jina MLX, or a failover chain made entirely of ordinal/listwise members, reject the floor even when retrieval is empty. If retrieval is empty for a chain that has a pointwise member, no member serves the request, so recall returns an empty result without applying the floor.
 
 For example, TypeSafe gives six ranked candidates ordinal scores `1, 5/6, 4/6, 3/6, 2/6, 1/6`. A `0.5` floor would retain four candidates by arithmetic, regardless of whether any is relevant. TypeSafe's own pruning still works without a reranker floor. `min_scores.final` remains available for ordinal providers, but its post-boost ranking score may also depend on the query pool.
 
@@ -808,7 +808,7 @@ Because freed slots are **not** backfilled, any floor can return fewer results t
 
 The main list of recalled facts, ordered by relevance. Relevance is computed by running four retrieval strategies in parallel — semantic similarity, BM25 keyword, graph traversal, and temporal — fusing their rankings with Reciprocal Rank Fusion (RRF), then re-scoring the merged candidates with a cross-encoder reranker against the original query.
 
-Each result carries a [`scores`](#scores) object (see below). Score meaning depends on the stage and the provider: TypeSafe's `scores.reranker` is a query-pool-dependent ordinal position, while a pointwise provider scores the query-document pair. Neither should be read as a calibrated cross-query confidence by default. For most agents the right approach is to consume memories in order and let `max_tokens` determine how many fit. Calibrate supported thresholds against your own unfiltered queries.
+Each result carries a [`scores`](#scores) object (see below). Score meaning depends on the stage and provider: TypeSafe publishes a query-pool-dependent ordinal position, Jina MLX computes listwise scores from the complete candidate prompt, and a pointwise provider scores the query-document pair. None should be read as calibrated cross-query confidence by default. For most agents the right approach is to consume memories in order and let `max_tokens` determine how many fit. Calibrate supported thresholds against your own unfiltered queries.
 
 Each item in `results` has the following fields:
 
@@ -865,7 +865,7 @@ For `observation`-type results only: the IDs of the original facts this observat
 An object of the per-stage scores for this result. `null` for `source_facts` entries, which are attached by provenance rather than ranked. Fields:
 
 - **`final`** — the ranking score after boosts. `results` is ordered by it descending. It is a relative signal, not a calibrated probability.
-- **`reranker`** — the reranker's normalized numeric score (`0`–`1`). For pointwise providers it belongs to the query-document pair. TypeSafe still publishes its ordinal rank position as a numeric value for compatibility and diagnostics; that position depends on the query pool and cannot be used with `min_scores.reranker`. `null` in RRF/interleave passthrough modes.
+- **`reranker`** — the reranker's normalized numeric score (`0`–`1`). For pointwise providers it belongs to the query-document pair. TypeSafe's ordinal position and Jina MLX's listwise score depend on the candidate pool and cannot be used with `min_scores.reranker`. `null` in RRF/interleave passthrough modes.
 - **`semantic`** — the raw vector cosine similarity (`0`–`1`). `null` if this result was not surfaced by semantic search.
 - **`keyword`** — the raw keyword/full-text (BM25) score (`≥ 0`, unbounded). `null` if this result was not surfaced by keyword search.
 

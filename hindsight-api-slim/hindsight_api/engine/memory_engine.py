@@ -1625,6 +1625,33 @@ def _resolve_reranking(config_dict: dict, reranking: "RecallReranking") -> "Reca
     return reranking
 
 
+def _validate_explicit_reranker_floor(reranking: "RecallReranking", min_scores: MinScores | None) -> None:
+    from hindsight_api.extensions.operation_validator import OperationValidationError
+
+    min_reranker = min_scores.reranker if min_scores else None
+    if min_reranker is not None and reranking in ("rrf", "interleave"):
+        raise OperationValidationError(
+            f"min_scores.reranker is not supported because reranking mode {reranking!r} "
+            "returns ordinal scores that only encode position",
+            status_code=400,
+        )
+
+
+def _configured_pool_dependent_floor_source(encoder: CrossEncoderModel) -> str | None:
+    """Describe a configured reranker only when every possible score is pool-dependent."""
+    if isinstance(encoder, MultiCrossEncoder):
+        semantics = encoder.possible_score_semantics
+        if all(not item.supports_absolute_floor for item in semantics):
+            values = ", ".join(sorted(item.value for item in semantics))
+            return f"every configured failover member returns pool-dependent scores ({values})"
+        return None
+
+    semantics = getattr(encoder, "score_semantics", ScoreSemantics.POINTWISE)
+    if not semantics.supports_absolute_floor:
+        return f"the configured reranker {encoder.provider_name!r} returns {semantics.value} scores"
+    return None
+
+
 def utcnow():
     """Get current UTC time with timezone info."""
     return datetime.now(UTC)
@@ -8451,6 +8478,7 @@ class MemoryEngine(MemoryEngineInterface):
         enable_temporal_retrieval = bool(budget_config_dict.get("enable_temporal_retrieval", True))
         enable_graph_retrieval = bool(budget_config_dict.get("enable_graph_retrieval", True))
         reranking = _resolve_reranking(budget_config_dict, reranking)
+        _validate_explicit_reranker_floor(reranking, min_scores)
 
         # Log recall start with tags if present (skip if quiet mode for internal operations)
         if not _quiet:
@@ -8801,12 +8829,6 @@ class MemoryEngine(MemoryEngineInterface):
             # for a store that CAN: equivalence is measured between stores, over the same corpus,
             # which needs no override because a store that declines uses this path already.
             min_reranker = min_scores.reranker if min_scores else None
-            if min_reranker is not None and reranking in ("rrf", "interleave"):
-                raise OperationValidationError(
-                    f"min_scores.reranker is not supported because reranking mode {reranking!r} "
-                    "returns ordinal scores that only encode position",
-                    status_code=400,
-                )
 
             from .memories import FullRecallRequest
             from .memories import get_memories as _get_memories_for_full_recall
@@ -9259,6 +9281,18 @@ class MemoryEngine(MemoryEngineInterface):
             step_start = time.time()
             reranker_instance = self._cross_encoder_reranker
 
+            # With no candidates there will be no served member to reveal a
+            # failover chain's semantics. Reject configurations that can only
+            # return pool-dependent scores before initializing a local model.
+            if min_reranker is not None and reranking == "cross_encoder" and not merged_candidates:
+                unsupported_source = _configured_pool_dependent_floor_source(reranker_instance.cross_encoder)
+                if unsupported_source is not None:
+                    raise OperationValidationError(
+                        f"min_scores.reranker is not supported because {unsupported_source}; "
+                        "these scores depend on the candidate pool and cannot be used as an absolute floor",
+                        status_code=400,
+                    )
+
             rerank_span = tracer_otel.start_span("hindsight.recall_rerank")
             rerank_span.set_attribute("hindsight.bank_id", bank_id)
             rerank_span.set_attribute("hindsight.candidates_count", len(merged_candidates))
@@ -9377,6 +9411,7 @@ class MemoryEngine(MemoryEngineInterface):
             finally:
                 rerank_span.set_attribute("hindsight.scored_count", len(scored_results))
                 if served_reranker is not None:
+                    rerank_span.set_attribute("hindsight.reranker_provider", served_reranker.provider_name)
                     rerank_span.set_attribute("hindsight.score_semantics", served_reranker.score_semantics.value)
                     rerank_span.set_attribute("hindsight.reranker_prunes_candidates", served_reranker.prunes_candidates)
                 if pre_filtered_count > 0:
@@ -9446,26 +9481,24 @@ class MemoryEngine(MemoryEngineInterface):
             # (a clearly-relevant match can score ~0.001 while its *ranking* is right).
             min_reranker = min_scores.reranker if min_scores else None
             min_final = min_scores.final if min_scores else None
-            ordinal_source: str | None = None
+            unsupported_score_source: str | None = None
             if min_reranker is not None:
                 if reranking in ("rrf", "interleave"):
-                    ordinal_source = f"reranking mode {reranking!r}"
+                    unsupported_score_source = f"reranking mode {reranking!r}"
                 elif served_reranker is not None:
-                    if served_reranker.score_semantics is ScoreSemantics.ORDINAL:
-                        ordinal_source = f"the served reranker {served_reranker.provider_name!r}"
+                    if not served_reranker.score_semantics.supports_absolute_floor:
+                        unsupported_score_source = (
+                            f"the served reranker {served_reranker.provider_name!r} returns "
+                            f"{served_reranker.score_semantics.value} scores"
+                        )
                 else:
-                    # With no scored candidate, a chain has no served member. Its
-                    # semantics are certain only when every possible member is ordinal.
-                    encoder = reranker_instance.cross_encoder
-                    if isinstance(encoder, MultiCrossEncoder):
-                        if all(member.score_semantics is ScoreSemantics.ORDINAL for member in encoder._members):
-                            ordinal_source = "every configured failover member"
-                    elif encoder.score_semantics is ScoreSemantics.ORDINAL:
-                        ordinal_source = f"the configured reranker {encoder.provider_name!r}"
-            if ordinal_source is not None:
+                    # With no scored candidate, semantics are certain only when
+                    # every possible configured member is pool-dependent.
+                    unsupported_score_source = _configured_pool_dependent_floor_source(reranker_instance.cross_encoder)
+            if unsupported_score_source is not None:
                 raise OperationValidationError(
-                    f"min_scores.reranker is not supported because {ordinal_source} "
-                    "returns ordinal scores that only encode position",
+                    f"min_scores.reranker is not supported because {unsupported_score_source}; "
+                    "these scores depend on the candidate pool and cannot be used as an absolute floor",
                     status_code=400,
                 )
             if (min_reranker is not None or min_final is not None) and scored_results:
@@ -9495,6 +9528,7 @@ class MemoryEngine(MemoryEngineInterface):
                 step_duration,
                 {
                     "reranker_type": rerank_kind,
+                    "reranker_provider": served_reranker.provider_name if served_reranker else None,
                     "candidates_reranked": len(scored_results),
                     "score_semantics": served_reranker.score_semantics.value if served_reranker else None,
                     "prunes_candidates": served_reranker.prunes_candidates if served_reranker else None,

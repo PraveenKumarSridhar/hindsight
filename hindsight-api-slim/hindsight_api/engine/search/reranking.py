@@ -8,7 +8,14 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from ..cross_encoder import RerankTimeoutError, ServedReranker, _served_reranker
+from ..cross_encoder import (
+    RerankTimeoutError,
+    ScoreSemantics,
+    ServedReranker,
+    begin_served_reranker_capture,
+    end_served_reranker_capture,
+    get_served_reranker,
+)
 from .types import MergedCandidate, ScoredResult
 
 logger = logging.getLogger(__name__)
@@ -409,7 +416,7 @@ class CrossEncoderReranker:
         # to score (#4696); the rest keep their pre-rerank (RRF) order behind the
         # scored ones rather than the recall never returning.
         unscored: set[int] = set()
-        token = _served_reranker.set(None)
+        token = begin_served_reranker_capture()
         try:
             try:
                 scores = await self.cross_encoder.predict(pairs)
@@ -417,15 +424,15 @@ class CrossEncoderReranker:
                 logger.warning(f"Reranking: {exc}; ranking the remainder by RRF order")
                 unscored = {i for i, score in enumerate(exc.scores) if score is None}
                 scores = [0.0 if score is None else score for score in exc.scores]
-            served = _served_reranker.get()
+            served = get_served_reranker()
         finally:
-            _served_reranker.reset(token)
+            end_served_reranker_capture(token)
         if served is None:
             # Single-member encoders have fixed capabilities for this instance.
             served = ServedReranker(
                 provider_name=self.cross_encoder.provider_name,
-                score_semantics=self.cross_encoder.score_semantics,
-                prunes_candidates=self.cross_encoder.prunes_candidates,
+                score_semantics=getattr(self.cross_encoder, "score_semantics", ScoreSemantics.POINTWISE),
+                prunes_candidates=getattr(self.cross_encoder, "prunes_candidates", False),
             )
 
         # Normalize scores to [0, 1] range.
