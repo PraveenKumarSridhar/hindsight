@@ -384,6 +384,26 @@ async def test_empty_pool_dependent_floor_is_rejected_before_reranker_initializa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["listwise", "pool_dependent_chain"])
+async def test_nonempty_pool_dependent_floor_is_rejected_before_reranker_initialization(
+    recall_harness: _RecallHarness, mode: str
+) -> None:
+    encoder: CrossEncoderModel = _Listwise()
+    if mode == "pool_dependent_chain":
+        encoder = MultiCrossEncoder([_Ordinal(), _Listwise()])
+    reranker = CrossEncoderReranker(cross_encoder=encoder)
+    reranker.ensure_initialized = AsyncMock(side_effect=RuntimeError("model load failed"))
+    recall_harness.engine._cross_encoder_reranker = reranker
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "pool" in exc_info.value.reason or "listwise" in exc_info.value.reason
+    reranker.ensure_initialized.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["pointwise", "mixed_chain"])
 async def test_empty_retrieval_with_possible_pointwise_member_accepts_floor(
     recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch, mode: str

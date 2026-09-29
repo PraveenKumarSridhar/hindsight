@@ -8923,6 +8923,20 @@ class MemoryEngine(MemoryEngineInterface):
                     _store_result.trace = _trace.to_dict() if _trace else None
                 return _store_result
 
+            # The store declined this request, so the in-process pipeline owns
+            # validation from here. Reject configurations that can only return
+            # pool-dependent scores before retrieval or local model startup. A
+            # mixed failover chain must continue because its served pointwise
+            # member can still support the floor.
+            if min_reranker is not None and reranking == "cross_encoder":
+                unsupported_source = _configured_pool_dependent_floor_source(self._cross_encoder_reranker.cross_encoder)
+                if unsupported_source is not None:
+                    raise OperationValidationError(
+                        f"min_scores.reranker is not supported because {unsupported_source}; "
+                        "these scores depend on the candidate pool and cannot be used as an absolute floor",
+                        status_code=400,
+                    )
+
             # Step 2: Optimized parallel retrieval using batched queries
             # - Semantic + BM25 combined in 1 CTE query for ALL fact types
             # - Graph runs per fact type (complex traversal)
@@ -9280,18 +9294,6 @@ class MemoryEngine(MemoryEngineInterface):
             # Step 4: Rerank using cross-encoder (MergedCandidate -> ScoredResult)
             step_start = time.time()
             reranker_instance = self._cross_encoder_reranker
-
-            # With no candidates there will be no served member to reveal a
-            # failover chain's semantics. Reject configurations that can only
-            # return pool-dependent scores before initializing a local model.
-            if min_reranker is not None and reranking == "cross_encoder" and not merged_candidates:
-                unsupported_source = _configured_pool_dependent_floor_source(reranker_instance.cross_encoder)
-                if unsupported_source is not None:
-                    raise OperationValidationError(
-                        f"min_scores.reranker is not supported because {unsupported_source}; "
-                        "these scores depend on the candidate pool and cannot be used as an absolute floor",
-                        status_code=400,
-                    )
 
             rerank_span = tracer_otel.start_span("hindsight.recall_rerank")
             rerank_span.set_attribute("hindsight.bank_id", bank_id)
