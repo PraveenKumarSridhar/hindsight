@@ -4955,8 +4955,12 @@ export type MentalModelTriggerOutput = {
  *
  * ``reranker`` and ``final`` are **post-query** filters applied to every scored
  * result after fusion and reranking, so these *are* per-result predicates: a
- * returned result always clears them. Use them, not the retrieval floors, to make
- * recall abstain on low-confidence queries.
+ * returned result always clears them. ``min_scores.reranker`` is accepted only
+ * when the reranker that actually serves the request returns a pointwise or
+ * calibrated-probability score. A listwise/ordinal provider such as TypeSafe,
+ * and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor
+ * would only select a fixed rank fraction. ``final`` remains available for
+ * ordinal providers.
  *
  * Any field left None imposes no floor; all-None (the default) means no score
  * filtering.
@@ -4977,7 +4981,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result.
+   * Post-query: minimum normalized reranker score (0-1), applied to every returned result. Accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction.
    */
   reranker?: number | null;
   /**
@@ -5532,7 +5536,7 @@ export type RecallRequest = {
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
-   * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned — use them for query abstention. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
+   * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned. `min_scores.reranker` is accepted only when the reranker that actually serves the request returns a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a fixed rank fraction. `min_scores.final` remains available for ordinal providers. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
    */
   min_scores?: MinScores | null;
   /**
@@ -5664,10 +5668,11 @@ export type RecallResult = {
  * Per-result recall scores from different stages of the pipeline.
  *
  * ``final`` is the value results are ranked by. The others are diagnostic and
- * can be filtered on via the recall ``min_scores`` request parameter. ``semantic``
- * and ``keyword`` are the raw per-strategy retrieval scores (``None`` when that
- * strategy did not surface this result); ``reranker`` is the cross-encoder's
- * normalized relevance.
+ * can be filtered on via the recall ``min_scores`` request parameter, subject to
+ * the reranker floor's score-semantics restriction. ``semantic`` and ``keyword``
+ * are the raw per-strategy retrieval scores (``None`` when that strategy did not
+ * surface this result). ``reranker`` is a normalized numeric score: pointwise for
+ * pointwise providers, but an ordinal position for TypeSafe.
  */
 export type RecallScores = {
   /**
@@ -5679,7 +5684,7 @@ export type RecallScores = {
   /**
    * Reranker
    *
-   * Cross-encoder relevance, normalized 0-1. None when the reranker is a passthrough (rrf/interleave modes).
+   * The reranker's normalized numeric score. For pointwise providers it belongs to the query-document pair. TypeSafe currently publishes an ordinal position for compatibility, so it is query-pool dependent and cannot be used with `min_scores.reranker`. None for RRF/interleave passthrough modes.
    */
   reranker?: number | null;
   /**

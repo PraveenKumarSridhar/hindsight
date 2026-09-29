@@ -486,8 +486,12 @@ class RecallRequest(BaseModel):
         "graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a "
         "stage that did not surface it (a non-null score always clears its floor). Setting both therefore "
         "does not restrict the response to results clearing both. `reranker` and `final` are post-ranking "
-        "filters applied to every scored result, so those floors *are* guaranteed by each result returned — "
-        "use them for query abstention. Any field left unset imposes no floor; omitting `min_scores` entirely "
+        "filters applied to every scored result, so those floors *are* guaranteed by each result returned. "
+        "`min_scores.reranker` is accepted only when the reranker that actually serves the request returns "
+        "a pointwise or calibrated-probability score. A listwise/ordinal provider such as TypeSafe, and "
+        "RRF/interleave passthrough modes, return HTTP 400 because a numeric floor would only select a "
+        "fixed rank fraction. `min_scores.final` remains available for ordinal providers. "
+        "Any field left unset imposes no floor; omitting `min_scores` entirely "
         "(the default) applies no score filtering. Use with care — the reranker's absolute scores are not "
         "calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).",
     )
