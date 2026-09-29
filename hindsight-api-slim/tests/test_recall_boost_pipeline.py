@@ -15,6 +15,7 @@ from hindsight_api.engine.cross_encoder import (
     RRFPassthroughCrossEncoder,
     ScoreSemantics,
 )
+from hindsight_api.engine.memories import FullRecallRequest
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.response_models import MinScores, RecallResult
 from hindsight_api.engine.search.reranking import CrossEncoderReranker, RerankResult
@@ -61,6 +62,15 @@ class _Ordinal(CrossEncoderModel):
 class _ConfigResolver:
     async def get_bank_config(self, _bank_id: str, _request_context: RequestContext) -> dict[str, object]:
         return {}
+
+
+class _ClaimingEmptyStore:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def full_recall(self, _request: FullRecallRequest) -> RecallResult:
+        self.calls += 1
+        return RecallResult(results=[])
 
 
 @dataclass
@@ -223,6 +233,25 @@ async def test_rrf_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHar
     assert exc_info.value.status_code == 400
     assert "min_scores.reranker" in exc_info.value.reason
     assert "ordinal" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reranking", ["rrf", "interleave"])
+async def test_explicit_ordinal_floor_is_rejected_before_store_full_recall(
+    recall_harness: _RecallHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    reranking: Literal["rrf", "interleave"],
+) -> None:
+    store = _ClaimingEmptyStore()
+    monkeypatch.setattr("hindsight_api.engine.memories.get_memories", lambda: store)
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(reranking=reranking, min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "min_scores.reranker" in exc_info.value.reason
+    assert "ordinal" in exc_info.value.reason
+    assert store.calls == 0
 
 
 async def _empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRetrievalResult:

@@ -8800,6 +8800,14 @@ class MemoryEngine(MemoryEngineInterface):
             # reached by their decline, not by a switch. There is deliberately no way to force it
             # for a store that CAN: equivalence is measured between stores, over the same corpus,
             # which needs no override because a store that declines uses this path already.
+            min_reranker = min_scores.reranker if min_scores else None
+            if min_reranker is not None and reranking in ("rrf", "interleave"):
+                raise OperationValidationError(
+                    f"min_scores.reranker is not supported because reranking mode {reranking!r} "
+                    "returns ordinal scores that only encode position",
+                    status_code=400,
+                )
+
             from .memories import FullRecallRequest
             from .memories import get_memories as _get_memories_for_full_recall
 
