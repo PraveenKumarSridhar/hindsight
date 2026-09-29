@@ -225,25 +225,53 @@ async def test_rrf_ordinal_reranker_floor_is_rejected(recall_harness: _RecallHar
     assert "ordinal" in exc_info.value.reason
 
 
-@pytest.mark.asyncio
-async def test_empty_retrieval_accepts_reranker_floor(
-    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRetrievalResult:
-        return MultiFactTypeRetrievalResult(
-            results_by_fact_type={
-                "world": ParallelRetrievalResult(
-                    semantic=[],
-                    bm25=[],
-                    graph=[],
-                    temporal=None,
-                    timings={"semantic": 0.0, "bm25": 0.0, "graph": 0.0, "temporal_extraction": 0.0},
-                )
-            }
-        )
+async def _empty_retrieval(*_args: object, **_kwargs: object) -> MultiFactTypeRetrievalResult:
+    return MultiFactTypeRetrievalResult(
+        results_by_fact_type={
+            "world": ParallelRetrievalResult(
+                semantic=[],
+                bm25=[],
+                graph=[],
+                temporal=None,
+                timings={"semantic": 0.0, "bm25": 0.0, "graph": 0.0, "temporal_extraction": 0.0},
+            )
+        }
+    )
 
-    monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", empty_retrieval)
-    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=_Ordinal())
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["typesafe", "rrf", "interleave", "rrf_provider", "ordinal_chain"])
+async def test_known_ordinal_empty_retrieval_rejects_reranker_floor(
+    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", _empty_retrieval)
+    encoder: CrossEncoderModel = _Ordinal()
+    if mode == "rrf_provider":
+        encoder = RRFPassthroughCrossEncoder()
+    elif mode == "ordinal_chain":
+        encoder = MultiCrossEncoder([_Ordinal(), RRFPassthroughCrossEncoder()])
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=encoder)
+    reranking = {"rrf": "rrf", "interleave": "interleave"}.get(mode, "cross_encoder")
+
+    with pytest.raises(OperationValidationError) as exc_info:
+        await recall_harness.recall(reranking=reranking, min_scores=MinScores(reranker=0.5))
+
+    assert exc_info.value.status_code == 400
+    assert "min_scores.reranker" in exc_info.value.reason
+    assert "ordinal" in exc_info.value.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["pointwise", "mixed_chain"])
+async def test_empty_retrieval_with_possible_pointwise_member_accepts_floor(
+    recall_harness: _RecallHarness, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr("hindsight_api.engine.search.retrieval.retrieve_all_fact_types_parallel", _empty_retrieval)
+    encoder: CrossEncoderModel = _Primary()
+    if mode == "mixed_chain":
+        encoder = MultiCrossEncoder([_Ordinal(), _Primary()])
+    recall_harness.engine._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=encoder)
+
     result = await recall_harness.recall(min_scores=MinScores(reranker=0.5))
     assert result.results == []
 

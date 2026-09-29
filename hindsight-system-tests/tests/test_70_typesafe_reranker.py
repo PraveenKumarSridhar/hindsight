@@ -26,7 +26,6 @@ from collections.abc import AsyncIterator
 import pytest
 from hindsight_client import Hindsight
 from hindsight_client_api.exceptions import BadRequestException
-
 from hindsight_system_tests import Stubs, wait_until_settled
 from hindsight_system_tests.payloads import consolidation, extracted, fact
 
@@ -132,3 +131,21 @@ async def test_ordinal_floor_is_http_400_and_no_floor_pruning_still_works(
 
     response = await typesafe_client.arecall(bank_id=typesafe_bank, query=QUERY)
     assert [result.text for result in response.results] == [BERLIN]
+
+
+async def test_ordinal_floor_is_http_400_when_retrieval_is_empty(
+    typesafe_client: Hindsight, typesafe_bank: str
+) -> None:
+    empty = await typesafe_client.arecall(bank_id=typesafe_bank, query=QUERY, types=["experience"])
+    assert empty.results == []
+
+    with pytest.raises(BadRequestException) as exc_info:
+        await typesafe_client.arecall(
+            bank_id=typesafe_bank,
+            query=QUERY,
+            types=["experience"],
+            min_scores={"reranker": 0.5},
+        )
+
+    assert exc_info.value.status == 400
+    assert "min_scores.reranker" in str(exc_info.value)

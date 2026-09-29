@@ -572,7 +572,7 @@ def validate_sql_schema(sql: str) -> None:
                         )
 
 
-from .cross_encoder import CrossEncoderModel, ScoreSemantics, ServedReranker
+from .cross_encoder import CrossEncoderModel, MultiCrossEncoder, ScoreSemantics, ServedReranker
 from .embeddings import Embeddings, create_embeddings_from_env
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 
@@ -9438,15 +9438,26 @@ class MemoryEngine(MemoryEngineInterface):
             # (a clearly-relevant match can score ~0.001 while its *ranking* is right).
             min_reranker = min_scores.reranker if min_scores else None
             min_final = min_scores.final if min_scores else None
-            if (
-                min_reranker is not None
-                and scored_results
-                and served_reranker is not None
-                and served_reranker.score_semantics is ScoreSemantics.ORDINAL
-            ):
+            ordinal_source: str | None = None
+            if min_reranker is not None:
+                if reranking in ("rrf", "interleave"):
+                    ordinal_source = f"reranking mode {reranking!r}"
+                elif served_reranker is not None:
+                    if served_reranker.score_semantics is ScoreSemantics.ORDINAL:
+                        ordinal_source = f"the served reranker {served_reranker.provider_name!r}"
+                else:
+                    # With no scored candidate, a chain has no served member. Its
+                    # semantics are certain only when every possible member is ordinal.
+                    encoder = reranker_instance.cross_encoder
+                    if isinstance(encoder, MultiCrossEncoder):
+                        if all(member.score_semantics is ScoreSemantics.ORDINAL for member in encoder._members):
+                            ordinal_source = "every configured failover member"
+                    elif encoder.score_semantics is ScoreSemantics.ORDINAL:
+                        ordinal_source = f"the configured reranker {encoder.provider_name!r}"
+            if ordinal_source is not None:
                 raise OperationValidationError(
-                    f"min_scores.reranker is not supported because the served reranker "
-                    f"{served_reranker.provider_name!r} returns ordinal scores that only encode position",
+                    f"min_scores.reranker is not supported because {ordinal_source} "
+                    "returns ordinal scores that only encode position",
                     status_code=400,
                 )
             if (min_reranker is not None or min_final is not None) and scored_results:
