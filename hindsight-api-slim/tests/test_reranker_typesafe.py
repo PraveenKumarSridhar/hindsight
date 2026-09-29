@@ -119,12 +119,12 @@ def _make_config(**overrides) -> HindsightConfig:
     return HindsightConfig(**defaults)
 
 
-def test_typesafe_declares_ordinal_scores():
+def test_typesafe_declares_ordinal_scores() -> None:
     encoder, _ = _encoder({"c0": 1.0})
     assert encoder.score_semantics is ScoreSemantics.ORDINAL
 
 
-def test_rrf_passthrough_declares_ordinal_scores():
+def test_rrf_passthrough_declares_ordinal_scores() -> None:
     assert RRFPassthroughCrossEncoder().score_semantics is ScoreSemantics.ORDINAL
 
 

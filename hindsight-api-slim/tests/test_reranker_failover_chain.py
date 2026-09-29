@@ -253,7 +253,7 @@ async def test_unreachable_primary_falls_over_to_the_next_member():
 
 
 @pytest.mark.asyncio
-async def test_failover_to_pruning_member_honors_its_cut():
+async def test_failover_to_pruning_member_honors_its_cut() -> None:
     primary = _FakeCrossEncoder("primary", predict_error=TimeoutError("down"))
     typesafe = _FakeCrossEncoder(
         "typesafe",
@@ -267,7 +267,7 @@ async def test_failover_to_pruning_member_honors_its_cut():
 
 
 @pytest.mark.asyncio
-async def test_failover_away_from_pruning_member_keeps_zero_score():
+async def test_failover_away_from_pruning_member_keeps_zero_score() -> None:
     typesafe = _FakeCrossEncoder(
         "typesafe",
         predict_error=TimeoutError("down"),
